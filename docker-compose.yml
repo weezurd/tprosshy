@@ -1,0 +1,57 @@
+services:
+  mongodb:
+    image: mongo:7.0.16
+    container_name: mongodb
+    ports:
+      - 27017
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=password
+    networks:
+      dockernet:
+        ipv4_address: 172.28.5.2
+
+  jump-server:
+    image: linuxserver/openssh-server:version-9.9_p2-r0
+    container_name: jump-server
+    ports:
+      - 2222
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - PUBLIC_KEY_FILE=/config/.ssh/id_ed25519.pub
+      - USER_NAME=pdd
+    volumes:
+      - ~/.ssh/id_ed25519.pub:/config/.ssh/id_ed25519.pub
+    networks:
+      dockernet:
+        ipv4_address: 172.28.5.3
+      hostnet:
+        ipv4_address: 172.30.5.3
+  
+  local-server:
+    image: linuxserver/openssh-server:version-9.9_p2-r0
+    container_name: local-server
+    networks:
+      hostnet:
+        ipv4_address: 172.30.5.4
+
+networks:
+  dockernet:
+    internal: true
+    name: dockernet
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          ip_range: 172.28.5.0/24
+          gateway: 172.28.5.254
+  hostnet:
+    name: hostnet
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/16
+          ip_range: 172.30.5.0/24
+          gateway: 172.30.5.254
