@@ -1,15 +1,9 @@
 use std::{error::Error, process::Stdio};
 
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, Command};
 
-pub fn ssh(
-    user: &str,
-    host: &str,
-    port: u16,
-    identity_file: &str,
-    remote_command: &str,
-) -> std::io::Result<(ChildStdin, ChildStdout)> {
-    let child = Command::new("ssh")
+pub fn ssh(user: &str, host: &str, port: u16, identity_file: &str, remote_command: &str) -> Child {
+    Command::new("ssh")
         .args([
             "-p",
             &port.to_string(),
@@ -33,12 +27,7 @@ pub fn ssh(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("Failed to ssh");
-
-    let stdin = child.stdin.expect("Failed to acquire stdin");
-    let stdout = child.stdout.expect("Failed to acquire stdout");
-
-    Ok((stdin, stdout))
+        .expect("Failed to ssh")
 }
 
 pub async fn scp(
@@ -49,8 +38,6 @@ pub async fn scp(
     local_file: &str,
     remote_file: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let remote = format!("{}@{}:{}", user, host, remote_file);
-
     let output = Command::new("scp")
         .args([
             "-P",
@@ -62,7 +49,7 @@ pub async fn scp(
             "-i",
             identity_file,
             local_file,
-            &remote,
+            &format!("{}@{}:{}", user, host, remote_file),
         ])
         .output()
         .await
