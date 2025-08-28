@@ -1,6 +1,8 @@
 use clap::{Parser, ValueEnum};
+use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_util::sync::CancellationToken;
 use tprosshy::{DATAGRAM_MAXSIZE, utils};
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -22,19 +24,19 @@ struct Args {
     destination: String,
 }
 
-async fn init_remote_tcp_proxy(destination: &str) {
-    let mut stream = match TcpStream::connect(destination).await {
+async fn init_remote_tcp_proxy(destination: String) {
+    let mut egress = match TcpStream::connect(destination).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to connect to destination: {}", e);
             return;
         }
     };
-    let mut stdio = utils::IOWrapper::default();
-    let _ = tokio::io::copy_bidirectional(&mut stdio, &mut stream).await;
+    let mut ingress = utils::IOWrapper::default();
+    let _ = tokio::io::copy_bidirectional(&mut ingress, &mut egress).await;
 }
 
-async fn init_remote_udp_proxy(destination: &str) {
+async fn init_remote_udp_proxy(destination: String) {
     let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
     let sock = UdpSocket::bind("0.0.0.0:0")
         .await
@@ -42,28 +44,34 @@ async fn init_remote_udp_proxy(destination: &str) {
     sock.connect(destination)
         .await
         .expect("Failed to connect to destination address");
-    let mut tx_buf = Vec::with_capacity(DATAGRAM_MAXSIZE);
-    let mut rx_buf = Vec::with_capacity(DATAGRAM_MAXSIZE);
-    loop {
-        tokio::select! {
-            Ok(nbytes) = stdin.read(&mut tx_buf) => {
-                sock.send(&tx_buf[..nbytes]).await.expect("Failed to send packet");
-            }
-            Ok(nbytes) = sock.recv(&mut rx_buf) => {
-                stdout.write(&tx_buf[..nbytes]).await.expect("Failed to write buffer");
-            }
+    let mut buf = Vec::with_capacity(DATAGRAM_MAXSIZE);
+    let mut nbytes: usize;
 
-        }
-    }
+    nbytes = stdin.read(&mut buf).await.expect("Failed to read buffer");
+    sock.send(&buf[..nbytes])
+        .await
+        .expect("Failed to send packet");
+
+    buf.clear();
+    
+    nbytes = sock.recv(&mut buf).await.expect("Failed to receive packet");
+    stdout
+        .write(&buf[..nbytes])
+        .await
+        .expect("Failed to write buffer");
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     utils::init_logger();
+    let task_tracker = tokio_util::task::TaskTracker::new();
 
     match &args.protocol {
-        Protocol::TCP => init_remote_tcp_proxy(&args.destination).await,
-        Protocol::UDP => init_remote_udp_proxy(&args.destination).await,
+        Protocol::TCP => task_tracker.spawn(init_remote_tcp_proxy(args.destination)),
+        Protocol::UDP => task_tracker.spawn(init_remote_udp_proxy(args.destination)),
     };
+
+    task_tracker.close();
+    task_tracker.wait().await;
 }
