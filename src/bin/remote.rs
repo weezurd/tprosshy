@@ -2,7 +2,6 @@ use clap::{Parser, ValueEnum};
 use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio_util::sync::CancellationToken;
 use tprosshy::{DATAGRAM_MAXSIZE, utils};
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -25,6 +24,7 @@ struct Args {
 }
 
 async fn init_remote_tcp_proxy(destination: String) {
+    info!("Received connection");
     let mut egress = match TcpStream::connect(destination).await {
         Ok(s) => s,
         Err(e) => {
@@ -53,7 +53,7 @@ async fn init_remote_udp_proxy(destination: String) {
         .expect("Failed to send packet");
 
     buf.clear();
-    
+
     nbytes = sock.recv(&mut buf).await.expect("Failed to receive packet");
     stdout
         .write(&buf[..nbytes])
@@ -64,7 +64,7 @@ async fn init_remote_udp_proxy(destination: String) {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    utils::init_logger();
+    utils::init_logger(Some("/tmp/tprosshy.log".to_string()));
     let task_tracker = tokio_util::task::TaskTracker::new();
 
     match &args.protocol {
@@ -74,4 +74,5 @@ async fn main() {
 
     task_tracker.close();
     task_tracker.wait().await;
+    info!("Connection closed");
 }
