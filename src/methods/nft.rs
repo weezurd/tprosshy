@@ -2,9 +2,9 @@ use super::{BaseMethod, get_original_dst};
 use once_cell::sync::Lazy;
 use std::error::Error;
 use std::io::Write;
+use std::net::SocketAddrV4;
 use std::process::Command;
 use tempfile::NamedTempFile;
-
 pub struct Method {
     path: String,
 }
@@ -20,6 +20,7 @@ add chain ip tprosshy PORTAL
 add rule ip tprosshy PREROUTING counter jump PORTAL
 add rule ip tprosshy OUTPUT counter jump PORTAL
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr 127.0.0.1 return
+add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{ssh_host_ip}} return
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{allow_ips}} redirect to {{local_server_port}}
 add rule ip tprosshy PORTAL meta l4proto udp ip daddr {{allow_ips}} counter meta nftrace set 1
 add rule ip tprosshy PORTAL fib daddr type local counter return
@@ -38,9 +39,15 @@ impl Method {
 }
 
 impl BaseMethod for Method {
-    fn setup_fw(&self, allow_ips: &str, local_server_port: u16) -> Result<(), Box<dyn Error>> {
+    fn setup_fw(
+        &self,
+        allow_ips: &str,
+        ssh_host_ip: &str,
+        local_server_port: u16,
+    ) -> Result<(), Box<dyn Error>> {
         let ruleset = RULESET_TEMPLATE
             .replace("{{allow_ips}}", allow_ips)
+            .replace("{{ssh_host_ip}}", ssh_host_ip)
             .replace("{{local_server_port}}", &local_server_port.to_string());
 
         let mut tmp_file = NamedTempFile::new_in("/tmp")?;
@@ -76,7 +83,7 @@ impl BaseMethod for Method {
         }
     }
 
-    fn get_original_dst(&self, fd: i32) -> Result<String, Box<dyn Error>> {
-        get_original_dst(fd)
+    fn get_original_dst(&self, sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>> {
+        get_original_dst(sock_ref)
     }
 }
