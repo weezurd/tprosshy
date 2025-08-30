@@ -1,16 +1,17 @@
+use chrono::Local;
 use core::task::Context;
 use core::task::Poll;
+use env_logger;
+use log::LevelFilter;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::pin::Pin;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf, Stdin, Stdout};
 use tokio::process::{ChildStdin, ChildStdout};
 
-use chrono::Local;
-use env_logger;
-use log::LevelFilter;
-use std::io::Write;
-
-pub fn init_logger() {
-    env_logger::Builder::new()
+pub fn init_logger(file_path: Option<String>) {
+    let mut logger = env_logger::Builder::new();
+    logger
         .format(|buf, record| {
             writeln!(
                 buf,
@@ -25,8 +26,20 @@ pub fn init_logger() {
                 record.args()
             )
         })
-        .filter(None, LevelFilter::Info)
-        .init();
+        .filter(None, LevelFilter::Info);
+
+    if let Some(path) = file_path {
+        let target = Box::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to create log file"),
+        );
+        logger.target(env_logger::Target::Pipe(target));
+    }
+
+    logger.init();
 }
 
 pub enum Tx {
