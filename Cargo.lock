@@ -823,6 +823,7 @@ dependencies = [
  "libc",
  "log",
  "once_cell",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-util",
