@@ -73,6 +73,7 @@ async fn main() {
     };
 
     task_tracker.close();
+    info!("Remote proxy started.");
     task_tracker.wait().await;
-    info!("Connection closed");
+    info!("Remote proxy finished.");
 }

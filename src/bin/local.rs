@@ -1,4 +1,4 @@
-use std::{os::fd::AsRawFd, sync::Arc};
+use std::sync::Arc;
 
 use clap::Parser;
 use log::{error, info};
@@ -21,7 +21,7 @@ struct Args {
     #[arg(short, long)]
     user: String,
 
-    /// Remote host
+    /// Remote host. Only IPv4 is supported for now.
     #[arg(short, long)]
     host: String,
 
@@ -56,14 +56,14 @@ async fn init_local_tcp_proxy(
         tokio::select! {
             Ok((mut ingress, _)) = listener.accept() => {
                 let orginal_dst = method
-                    .get_original_dst(ingress.as_raw_fd())
+                    .get_original_dst(socket2::SockRef::from(&ingress))
                     .expect("Failed to get orignal destination");
                 let mut proc = ssh(
                     &args.user,
                     &args.host,
                     args.port,
                     &args.identity_file,
-                    &format!("remote_proxy -p tcp -d {}", orginal_dst),
+                    Some(&format!("/tmp/remote -p tcp -d {}", orginal_dst)),
                 );
                 let ssh_in = proc.stdin.take().expect("Failed to acquire stdin");
                 let ssh_out = proc.stdout.take().expect("Failed to acquire stdout");
@@ -73,6 +73,7 @@ async fn init_local_tcp_proxy(
                 };
                 let local_token = token.clone();
                 task_tracker.spawn(async move {
+                    info!("New connection opened");
                     tokio::select! {
                         x = tokio::io::copy_bidirectional(&mut ingress, &mut egress) => {
                             match x {
@@ -85,9 +86,10 @@ async fn init_local_tcp_proxy(
                                     error!("Error while proxying: {err}");
                                 }
                             }
+                            let _ = proc.kill().await.expect("Failed to kill ssh process");
                         }
                         _ = local_token.cancelled() => {
-                            let _ = proc.start_kill();
+                            let _ = proc.kill().await.expect("Failed to kill ssh process");
                         }
                     }
                 });
@@ -120,14 +122,14 @@ async fn init_local_udp_proxy(
                     .await
                     .expect("Failed to bind to origin socket");
                 let orginal_dst = method
-                    .get_original_dst(egress.as_raw_fd())
+                    .get_original_dst(socket2::SockRef::from(&egress))
                     .expect("Failed to get original destination");
                 let mut proc = ssh(
                     &args.user,
                     &args.host,
                     args.port,
                     &args.identity_file,
-                    &format!("remote_proxy -p udp -d {}", orginal_dst),
+                    Some(&format!("/tmp/remote -p udp -d {}", orginal_dst)),
                 );
                 task_tracker.spawn(async move {
                     let mut ssh_in = proc.stdin.take().expect("Failed to acquire stdin");
@@ -155,20 +157,21 @@ async fn init_local_udp_proxy(
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    utils::init_logger();
+    let _ssh_control_master = ssh(&args.user, &args.host, args.port, &args.identity_file, None);
+    utils::init_logger(None);
     scp(
         &args.user,
         &args.host,
         args.port,
         &args.identity_file,
-        "remote_proxy",
-        "remote_proxy",
+        "target/x86_64-unknown-linux-musl/release/remote",
+        "/tmp/remote",
     )
     .await
     .expect("Failed to upload executable to remote");
     let arc_m = Arc::new(get_available_method());
     arc_m
-        .setup_fw(&args.ip_range, LOCAL_TCP_PORT)
+        .setup_fw(&args.ip_range, &args.host, LOCAL_TCP_PORT)
         .expect("Failed to setup firewall");
 
     let token = CancellationToken::new();
@@ -189,9 +192,11 @@ async fn main() {
     ));
     task_tracker.close();
 
+    info!("Local proxy started.");
     let _ = tokio::signal::ctrl_c().await;
     info!("Shutdown signal received. Attempt to gracefully shutdown...");
     token.cancel();
     task_tracker.wait().await;
-    info!("Bye.");
+    arc_m.restore_fw().expect("Failed to restore firewall");
+    info!("Local proxy finished.");
 }
