@@ -21,8 +21,8 @@ add rule ip tprosshy PREROUTING counter jump PORTAL
 add rule ip tprosshy OUTPUT counter jump PORTAL
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr 127.0.0.1 return
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{ssh_host_ip}} return
-add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{allow_ips}} redirect to {{local_server_port}}
-add rule ip tprosshy PORTAL meta l4proto udp ip daddr {{allow_ips}} counter meta nftrace set 1
+add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{allow_ips}} redirect to {{tcp_port}}
+add rule ip tprosshy PORTAL meta l4proto udp ip daddr 127.0.0.53 udp dport 53 redirect to {{udp_port}}
 add rule ip tprosshy PORTAL fib daddr type local counter return
 "#
     .to_string()
@@ -43,12 +43,14 @@ impl BaseMethod for Method {
         &self,
         allow_ips: &str,
         ssh_host_ip: &str,
-        local_server_port: u16,
+        tcp_port: u16,
+        udp_port: u16,
     ) -> Result<(), Box<dyn Error>> {
         let ruleset = RULESET_TEMPLATE
             .replace("{{allow_ips}}", allow_ips)
             .replace("{{ssh_host_ip}}", ssh_host_ip)
-            .replace("{{local_server_port}}", &local_server_port.to_string());
+            .replace("{{tcp_port}}", &tcp_port.to_string())
+            .replace("{{udp_port}}", &udp_port.to_string());
 
         let mut tmp_file = NamedTempFile::new_in("/tmp")?;
         write!(tmp_file, "{}", ruleset)?;

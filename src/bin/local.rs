@@ -90,6 +90,7 @@ async fn init_local_tcp_proxy(
                         }
                         _ = local_token.cancelled() => {
                             let _ = proc.kill().await.expect("Failed to kill ssh process");
+                            info!("Connection closed by token");
                         }
                     }
                 });
@@ -111,38 +112,59 @@ async fn init_local_udp_proxy(
     let ingress = UdpSocket::bind(format!("0.0.0.0:{}", LOCAL_UDP_PORT))
         .await
         .expect("Failed to bind address");
+    let ingress_reader = Arc::new(ingress);
 
     let task_tracker = tokio_util::task::TaskTracker::new();
 
     loop {
-        let mut buf = Vec::with_capacity(DATAGRAM_MAXSIZE);
+        let mut buf = [0 as u8; DATAGRAM_MAXSIZE];
         tokio::select! {
-            Ok((_nbytes, addr)) = ingress.recv_from(&mut buf) => {
-                let egress = UdpSocket::bind(addr)
-                    .await
-                    .expect("Failed to bind to origin socket");
+            Ok((nbytes, addr)) = ingress_reader.recv_from(&mut buf) => {
+                let ingress_writer = ingress_reader.clone();
+                ingress_writer.connect(addr).await.expect("Failed to connect to client");
                 let orginal_dst = method
-                    .get_original_dst(socket2::SockRef::from(&egress))
-                    .expect("Failed to get original destination");
+                    .get_original_dst(socket2::SockRef::from(&ingress_writer))
+                    .expect("Failed to get orignal destination");
+                info!("Original destination: {}", orginal_dst);
+
                 let mut proc = ssh(
                     &args.user,
                     &args.host,
                     args.port,
                     &args.identity_file,
-                    Some(&format!("/tmp/remote -p udp -d {}", orginal_dst)),
+                    Some(&format!("/tmp/remote -p udp -d {}", "127.0.0.1:8080")),
                 );
                 task_tracker.spawn(async move {
                     let mut ssh_in = proc.stdin.take().expect("Failed to acquire stdin");
                     let mut ssh_out = proc.stdout.take().expect("Failed to acquire stdout");
-                    ssh_in.write(&buf).await.expect("Failed to write buffer");
 
-                    buf.clear();
+                    ssh_in.write(&nbytes.to_be_bytes()).await.expect("Failed to write buffer");
+                    ssh_in.flush().await.expect("Failed to flush stdin");
+                    info!("Going to send {} bytes to remote", nbytes);
 
-                    let nbytes = ssh_out.read(&mut buf).await.expect("Failed to read buffer");
-                    egress
+                    ssh_in.write(&buf[..nbytes]).await.expect("Failed to write buffer");
+                    ssh_in.flush().await.expect("Failed to flush stdin");
+                    info!("Sent {} bytes to remote", nbytes);
+
+                    let mut buf_size_raw = (0 as usize).to_be_bytes();
+                    ssh_out
+                        .read_exact(&mut buf_size_raw)
+                        .await
+                        .expect("Failed to read buffer");
+                    let buf_size: usize = usize::from_be_bytes(buf_size_raw);
+                    info!("Going to read {} from tunnel", buf_size);
+
+                    let mut buf = vec![0 as u8; buf_size];
+                    let nbytes = ssh_out
+                        .read_exact(&mut buf)
+                        .await
+                        .expect("Failed to read buffer");
+                    info!("Received {} bytes from ssh tunnel", nbytes);
+                    let nbytes = ingress_writer
                         .send(&buf[..nbytes])
                         .await
                         .expect("Failed to send buffer to local client");
+                    info!("Sent {} to client {}", nbytes, addr);
                 });
             }
             _ = token.cancelled() => {
@@ -171,7 +193,7 @@ async fn main() {
     .expect("Failed to upload executable to remote");
     let arc_m = Arc::new(get_available_method());
     arc_m
-        .setup_fw(&args.ip_range, &args.host, LOCAL_TCP_PORT)
+        .setup_fw(&args.ip_range, &args.host, LOCAL_TCP_PORT, LOCAL_UDP_PORT)
         .expect("Failed to setup firewall");
 
     let token = CancellationToken::new();

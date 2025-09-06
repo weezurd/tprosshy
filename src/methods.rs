@@ -18,7 +18,8 @@ pub trait BaseMethod {
         &self,
         allow_ips: &str,
         ssh_host_ip: &str,
-        local_server_port: u16,
+        tcp_port: u16,
+        udp_port: u16,
     ) -> Result<(), Box<dyn Error>>;
     fn restore_fw(&self) -> Result<(), Box<dyn Error>>;
     fn get_original_dst(&self, sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>>;

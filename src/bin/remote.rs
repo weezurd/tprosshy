@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use log::info;
+use log::{error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tprosshy::{DATAGRAM_MAXSIZE, utils};
@@ -24,7 +24,6 @@ struct Args {
 }
 
 async fn init_remote_tcp_proxy(destination: String) {
-    info!("Received connection");
     let mut egress = match TcpStream::connect(destination).await {
         Ok(s) => s,
         Err(e) => {
@@ -33,7 +32,17 @@ async fn init_remote_tcp_proxy(destination: String) {
         }
     };
     let mut ingress = utils::IOWrapper::default();
-    let _ = tokio::io::copy_bidirectional(&mut ingress, &mut egress).await;
+    let x = tokio::io::copy_bidirectional(&mut ingress, &mut egress).await;
+    match x {
+        Ok((to_egress, to_ingress)) => {
+            info!(
+                "Connection ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
+            )
+        }
+        Err(err) => {
+            error!("Error while proxying: {err}");
+        }
+    }
 }
 
 async fn init_remote_udp_proxy(destination: String) {
@@ -44,21 +53,41 @@ async fn init_remote_udp_proxy(destination: String) {
     sock.connect(destination)
         .await
         .expect("Failed to connect to destination address");
-    let mut buf = Vec::with_capacity(DATAGRAM_MAXSIZE);
-    let mut nbytes: usize;
+    info!("Connected to destination");
+    let mut buf_size_raw = (0 as usize).to_be_bytes();
+    stdin
+        .read_exact(&mut buf_size_raw)
+        .await
+        .expect("Failed to read buffer");
+    let buf_size: usize = usize::from_be_bytes(buf_size_raw);
+    info!("Going to read {} bytes from tunnel", buf_size);
 
-    nbytes = stdin.read(&mut buf).await.expect("Failed to read buffer");
+    let mut buf = vec![0 as u8; buf_size];
+    let mut nbytes = stdin
+        .read_exact(&mut buf)
+        .await
+        .expect("Failed to read buffer");
+    info!("Received {} bytes from ssh tunnel", nbytes);
+
     sock.send(&buf[..nbytes])
         .await
         .expect("Failed to send packet");
 
-    buf.clear();
-
+    let mut buf = [0 as u8; DATAGRAM_MAXSIZE];
     nbytes = sock.recv(&mut buf).await.expect("Failed to receive packet");
+    stdout
+        .write(&nbytes.to_be_bytes())
+        .await
+        .expect("Failed to write buffer");
+    stdout.flush().await.expect("Failed to flush stdout");
+    info!("Going to send {} bytes to local", nbytes);
+
     stdout
         .write(&buf[..nbytes])
         .await
         .expect("Failed to write buffer");
+    stdout.flush().await.expect("Failed to flush stdout");
+    info!("Sent {} bytes to local", nbytes);
 }
 
 #[tokio::main]
