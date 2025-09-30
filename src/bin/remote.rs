@@ -1,106 +1,177 @@
-use clap::{Parser, ValueEnum};
-use log::{error, info};
+use std::collections::HashMap;
+
+use log::info;
+use std::net::SocketAddrV4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tprosshy::{DATAGRAM_MAXSIZE, utils};
+use tprosshy::{
+    DATAGRAM_MAXSIZE, Frame, FrameType, Header, Protocol,
+    utils::{self},
+};
 
-#[derive(Debug, Clone, ValueEnum)]
-enum Protocol {
-    TCP,
-    UDP,
-}
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
-/// Transparent proxy over ssh. Remote proxy.
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// Protocol
-    #[arg(value_enum, short, long)]
-    protocol: Protocol,
-
-    /// Destination address
-    #[arg(short, long)]
-    destination: String,
-}
-
-async fn init_remote_tcp_proxy(destination: String) {
-    let mut egress = match TcpStream::connect(destination).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to connect to destination: {}", e);
-            return;
-        }
+async fn mux(token: CancellationToken) {
+    let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    let mut ingress = utils::IOWrapper {
+        tx: utils::Tx::Std(stdout),
+        rx: utils::Rx::Std(stdin),
     };
-    let mut ingress = utils::IOWrapper::default();
-    let x = tokio::io::copy_bidirectional(&mut ingress, &mut egress).await;
-    match x {
-        Ok((to_egress, to_ingress)) => {
-            info!(
-                "Connection ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
-            )
-        }
-        Err(err) => {
-            error!("Error while proxying: {err}");
+    let (mux_tx, mut mux_rx) = tokio::sync::mpsc::channel::<Frame>(1);
+
+    let task_tracker = tokio_util::task::TaskTracker::new();
+    let mut tx_pool = HashMap::new();
+    let mut ser_buf = vec![];
+
+    loop {
+        let mut header_buf = [0 as u8; size_of::<Header>()];
+        tokio::select! {
+            Ok(_) = ingress.read_exact(&mut header_buf) => {
+                if let Ok((header, _)) = Header::deserialize(&header_buf) {
+                    match header.ftype {
+                        FrameType::Rst => return,
+                        _ => {
+                            if !tx_pool.contains_key(&header.id) {
+                                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                                tx_pool.insert(header.id, tx);
+
+                                match header.protocol {
+                                    Protocol::TCP => {
+                                        task_tracker.spawn(handle_tcp(
+                                            mux_tx.clone(),
+                                            rx,
+                                            header.id,
+                                            token.clone(),
+                                            header.dst,
+                                        ));
+                                    }
+                                    Protocol::UDP => {
+                                        task_tracker.spawn(handle_udp(
+                                            mux_tx.clone(),
+                                            rx,
+                                            header.id,
+                                            header.dst,
+                                        ));
+                                    }
+                                }
+                            }
+
+                            let mut buf = vec![0; header.size as usize];
+                            ingress
+                                .read_exact(&mut buf)
+                                .await
+                                .expect("Failed to read exact payload");
+                            tx_pool
+                                .get_mut(&header.id)
+                                .expect("Failed to get receiver")
+                                .send(buf)
+                                .await
+                                .expect("Failed to send buffer");
+                        }
+                    }
+                }
+            }
+            Some(frame) = mux_rx.recv() => {
+                if let Ok(_) = frame.serialize(&mut ser_buf) {
+                    ingress.write(&ser_buf).await.expect("Failed to write buffer");
+                };
+            }
+            _ = token.cancelled() => {
+                return
+            }
         }
     }
 }
 
-async fn init_remote_udp_proxy(destination: String) {
-    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
-    let sock = UdpSocket::bind("0.0.0.0:0")
+async fn handle_tcp(
+    tx: Sender<Frame>,
+    mut rx: Receiver<Vec<u8>>,
+    id: u32,
+    token: CancellationToken,
+    destination: SocketAddrV4,
+) {
+    let mut egress = TcpStream::connect(destination)
+        .await
+        .expect("Failed to connect to destination");
+    loop {
+        let mut buf = vec![];
+        tokio::select! {
+            Ok(nread) = egress.read(&mut buf) => {
+                if nread > 0 {
+                    let frame = Frame {
+                        header: Header {
+                            id: id,
+                            ftype: FrameType::Data,
+                            protocol: Protocol::TCP,
+                            size: nread as u32,
+                            dst: destination,
+                        },
+                        payload: buf
+                    };
+                    tx.send(frame).await.expect("Failed to send frame");
+                } else {
+                    info!("Channel closed");
+                    return
+                }
+            }
+            Some(b) = rx.recv() => {
+                egress.write(&b).await.expect("Failed to write buffer");
+            }
+            _ = token.cancelled() => {
+                return
+            }
+        }
+    }
+}
+
+async fn handle_udp(
+    tx: Sender<Frame>,
+    mut rx: Receiver<Vec<u8>>,
+    id: u32,
+    destination: SocketAddrV4,
+) {
+    let egress = UdpSocket::bind(format!("0.0.0.0:0"))
         .await
         .expect("Failed to bind address");
-    sock.connect(destination)
-        .await
-        .expect("Failed to connect to destination address");
-    info!("Connected to destination");
-    let mut buf_size_raw = (0 as usize).to_be_bytes();
-    stdin
-        .read_exact(&mut buf_size_raw)
-        .await
-        .expect("Failed to read buffer");
-    let buf_size: usize = usize::from_be_bytes(buf_size_raw);
-    info!("Going to read {} bytes from tunnel", buf_size);
 
-    let mut buf = vec![0 as u8; buf_size];
-    let mut nbytes = stdin
-        .read_exact(&mut buf)
+    egress
+        .connect(destination)
         .await
-        .expect("Failed to read buffer");
-    info!("Received {} bytes from ssh tunnel", nbytes);
+        .expect("Failed to connect to destination");
 
-    sock.send(&buf[..nbytes])
-        .await
-        .expect("Failed to send packet");
+    let b = rx.recv().await.expect("Failed to receive buffer");
+    egress.send(&b).await.expect("Failed to write buffer");
 
     let mut buf = [0 as u8; DATAGRAM_MAXSIZE];
-    nbytes = sock.recv(&mut buf).await.expect("Failed to receive packet");
-    stdout
-        .write(&nbytes.to_be_bytes())
+    let (nrecv, _) = egress
+        .recv_from(&mut buf)
         .await
-        .expect("Failed to write buffer");
-    stdout.flush().await.expect("Failed to flush stdout");
-    info!("Going to send {} bytes to local", nbytes);
+        .expect("Failed to receive buffer");
+    let frame = Frame {
+        header: Header {
+            id: id,
+            ftype: FrameType::Data,
+            protocol: Protocol::UDP,
+            size: nrecv as u32,
+            dst: destination,
+        },
+        payload: buf[..nrecv].into(),
+    };
+    tx.send(frame).await.expect("Failed to send frame");
+}
 
-    stdout
-        .write(&buf[..nbytes])
-        .await
-        .expect("Failed to write buffer");
-    stdout.flush().await.expect("Failed to flush stdout");
-    info!("Sent {} bytes to local", nbytes);
+async fn init_remote_proxy(token: CancellationToken) {
+    mux(token).await;
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
     utils::init_logger(Some("/tmp/tprosshy.log".to_string()));
     let task_tracker = tokio_util::task::TaskTracker::new();
+    let token = CancellationToken::new();
 
-    match &args.protocol {
-        Protocol::TCP => task_tracker.spawn(init_remote_tcp_proxy(args.destination)),
-        Protocol::UDP => task_tracker.spawn(init_remote_udp_proxy(args.destination)),
-    };
-
+    task_tracker.spawn(init_remote_proxy(token));
     task_tracker.close();
     info!("Remote proxy started.");
     task_tracker.wait().await;
