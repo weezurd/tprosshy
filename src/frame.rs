@@ -3,6 +3,8 @@ use std::net::SocketAddrV4;
 use bincode;
 use bincode::{Decode, Encode};
 
+use crate::BUFSIZE;
+
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum FrameType {
     Data,
@@ -29,17 +31,15 @@ pub struct Header {
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub struct Frame {
     pub header: Header,
-    pub payload: Vec<u8>,
+    pub payload: [u8; BUFSIZE],
 }
 
 impl Frame {
     pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, bincode::error::EncodeError> {
         bincode::encode_into_slice(&self, buf, bincode::config::standard())
     }
-}
 
-impl Header {
-    pub fn deserialize(buf: &[u8]) -> Result<(Header, usize), bincode::error::DecodeError> {
+    pub fn deserialize(buf: &[u8]) -> Result<(Frame, usize), bincode::error::DecodeError> {
         bincode::decode_from_slice(buf, bincode::config::standard())
     }
 }

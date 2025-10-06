@@ -32,7 +32,9 @@ pub fn init_logger(file_path: Option<String>) {
         let target = Box::new(
             OpenOptions::new()
                 .create(true)
-                .append(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
                 .open(path)
                 .expect("Failed to create log file"),
         );
