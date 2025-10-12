@@ -8,15 +8,14 @@ use crate::BUFSIZE;
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum FrameType {
     Data,
-    GoAway,
-    Ping,
+    HalfClosed,
     Rst,
 }
 
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum Protocol {
     TCP,
-    UDP,
+    DNS,
 }
 
 #[derive(Encode, Decode, PartialEq, Debug)]
