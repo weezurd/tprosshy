@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use log::{info, warn};
-use std::net::SocketAddrV4;
+use log::{debug, error, info, warn};
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tprosshy::{
@@ -19,11 +21,12 @@ async fn mux(token: CancellationToken) {
         rx: utils::Rx::Std(stdin),
     };
     let (mux_tx, mut mux_rx) = tokio::sync::mpsc::channel::<Frame>(1);
-
-    let task_tracker = tokio_util::task::TaskTracker::new();
+    let mut join_set = tokio::task::JoinSet::new();
     let mut tx_pool = HashMap::new();
-
     let mut raw_buf = [0u8; size_of::<Frame>()];
+    let dns_resolvers = Arc::new(utils::get_system_resolvers());
+
+    info!("Start demuxing task");
     loop {
         tokio::select! {
             read_result = ingress.read_exact(&mut raw_buf) => {
@@ -32,18 +35,17 @@ async fn mux(token: CancellationToken) {
                     return
                 }
 
-                info!("Received some bytes");
                 let (frame, _) = Frame::deserialize(&raw_buf).expect("Failed to deserialize raw buffer");
                 match frame.header.ftype {
                     FrameType::Rst => return,
                     _ => {
                         if !tx_pool.contains_key(&frame.header.id) {
-                            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                            let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(1);
                             tx_pool.insert(frame.header.id, tx);
 
                             match frame.header.protocol {
                                 Protocol::TCP => {
-                                    task_tracker.spawn(handle_tcp(
+                                    join_set.spawn(handle_tcp(
                                         mux_tx.clone(),
                                         rx,
                                         frame.header.id,
@@ -51,22 +53,23 @@ async fn mux(token: CancellationToken) {
                                         frame.header.dst,
                                     ));
                                 }
-                                Protocol::UDP => {
-                                    task_tracker.spawn(handle_udp(
+                                Protocol::DNS => {
+                                    join_set.spawn(handle_dns(
                                         mux_tx.clone(),
                                         rx,
                                         frame.header.id,
-                                        frame.header.dst,
+                                        dns_resolvers.clone()
                                     ));
                                 }
                             }
                         }
-                        tx_pool
+                        if tx_pool
                             .get_mut(&frame.header.id)
-                            .expect("Failed to get receiver")
-                            .send(frame.payload[..frame.header.size as usize].to_vec())
-                            .await
-                            .expect("Failed to send buffer");
+                            .unwrap()
+                            .send(frame)
+                            .await.is_err() {
+                                warn!("Failed to send buffer");
+                            }
                     }
                 }
             }
@@ -75,6 +78,12 @@ async fn mux(token: CancellationToken) {
                     ingress.write_all(&raw_buf).await.expect("Failed to write buffer");
                     ingress.flush().await.expect("Failed to flush buffer");
                 };
+            }
+            Some(res) = join_set.join_next() => {
+                match res {
+                    Ok(id) => {tx_pool.remove(&id);}
+                    Err(e) => {warn!("Something weird happend with an underlying task: {}", e)}
+                }
             }
             _ = token.cancelled() => {
                 return
@@ -85,87 +94,158 @@ async fn mux(token: CancellationToken) {
 
 async fn handle_tcp(
     tx: Sender<Frame>,
-    mut rx: Receiver<Vec<u8>>,
+    mut rx: Receiver<Frame>,
     id: u32,
     token: CancellationToken,
     destination: SocketAddrV4,
-) {
-    info!("Received request to connect to {}", destination);
-    let mut egress = TcpStream::connect(destination)
-        .await
-        .expect("Failed to connect to destination");
-    loop {
-        let mut buf = [0u8; BUFSIZE];
-        tokio::select! {
-            read_result = egress.read(&mut buf) => {
-                info!("Received some bytes from egress..");
-                if let Ok(nread) = read_result && nread > 0 {
+) -> u32 {
+    debug!("TCP channel {} opened. Destination: {}", id, destination);
+    if let Ok(mut egress) = TcpStream::connect(destination).await {
+        loop {
+            let mut buf = [0u8; BUFSIZE];
+            tokio::select! {
+                read_result = egress.read(&mut buf) => {
+                    match read_result {
+                        Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
+                            debug!("TCP channel {}: Client disconnected. Maybe RST", id);
+                        }
+                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                            debug!("TCP channel {}: Client disconnected. Maybe FIN", id);
+                        }
+                        Err(e) => {
+                            warn!("TCP channel {}: Client disconnected. Unexpected error: {}", id, e);
+                        }
+                        Ok(nread) if nread == 0 => {
+                            debug!("TCP channel {}: Channel closed with EOF", id);
+                        }
+                        Ok(nread) => {
+                            let frame = Frame {
+                                header: Header {
+                                    id: id,
+                                    ftype: FrameType::Data,
+                                    protocol: Protocol::TCP,
+                                    size: nread as u32,
+                                    dst: destination,
+                                },
+                                payload: buf
+                            };
+                            if tx.send(frame).await.is_err() {
+                                warn!("TCP channel {}: Failed to send frame", id);
+                                break
+                            }
+                            continue
+                        }
+                    }
                     let frame = Frame {
                         header: Header {
                             id: id,
-                            ftype: FrameType::Data,
+                            ftype: FrameType::HalfClosed,
                             protocol: Protocol::TCP,
-                            size: nread as u32,
+                            size: 0,
                             dst: destination,
                         },
                         payload: buf
                     };
-                    tx.send(frame).await.expect("Failed to send frame");
-                } else {
-                    if read_result.is_err() {
-                        warn!("Channel closed with error: {}", read_result.unwrap_err());
-                    } else {
-                        info!("Channel closed");
+                    if tx.send(frame).await.is_err() {
+                        error!("TCP channel {}: Failed to send HalfClosed frame. \
+                                Local channel might transit to stale state", id);
                     }
-                    return
+                    break
+                }
+                Some(frame) = rx.recv() => {
+                    match frame.header.ftype {
+                        FrameType::Data => {
+                            match egress.write_all(&frame.payload[..frame.header.size as usize]).await {
+                                Ok(_) => {continue}
+                                Err(e) => {
+                                    warn!("TCP channel {}: Failed to write buffer: {}", id, e);
+                                    let frame = Frame {
+                                        header: Header {
+                                            id: id,
+                                            ftype: FrameType::HalfClosed,
+                                            protocol: Protocol::TCP,
+                                            size: 0,
+                                            dst: destination,
+                                        },
+                                        payload: buf
+                                    };
+                                    if tx.send(frame).await.is_err() {
+                                        error!("TCP channel {}: Failed to send HalfClosed frame. \
+                                                Local channel might transit to stale state", id);
+                                        break
+                                    }
+                                }
+                            }
+                        },
+                        FrameType::HalfClosed => {
+                            debug!("TCP channel {}: HalfClosed received", id);
+                            break
+                        }
+                        FrameType::Rst => {
+                            debug!("TCP channel {}: Rst received. Doesn't expect this tho", id);
+                            break
+                        }
+                    }
+                }
+                _ = token.cancelled() => {
+                    break
                 }
             }
-            Some(b) = rx.recv() => {
-                info!("Writing {} bytes to egress", b.len());
-                egress.write_all(&b).await.expect("Failed to write buffer");
-                egress.flush().await.expect("Failed to flush buffer");
-            }
-            _ = token.cancelled() => {
-                return
-            }
         }
+    } else {
+        warn!("TCP channel {}: Failed to connect to destination", id);
     }
+    debug!("TCP channel {}: Channel closed", id);
+
+    return id;
 }
 
-async fn handle_udp(
+async fn handle_dns(
     tx: Sender<Frame>,
-    mut rx: Receiver<Vec<u8>>,
+    mut rx: Receiver<Frame>,
     id: u32,
-    destination: SocketAddrV4,
-) {
-    let egress = UdpSocket::bind(format!("0.0.0.0:0"))
-        .await
-        .expect("Failed to bind address");
+    dns_resolvers: Arc<Vec<SocketAddrV4>>,
+) -> u32 {
+    debug!("DNS channel {} opened", id);
+    for resolver in dns_resolvers.iter() {
+        if let Ok(egress) = UdpSocket::bind(format!("0.0.0.0:0")).await
+            && let Ok(_) = egress.connect(resolver).await
+            && let Some(frame) = rx.recv().await
+            && let Ok(_) = egress
+                .send(&frame.payload[..frame.header.size as usize])
+                .await
+        {
+            debug!("DNS channel {}: Sent some bytes to {}", id, resolver);
+            let mut buf = [0u8; BUFSIZE];
+            match egress.recv_from(&mut buf).await {
+                Ok((nrecv, _)) => {
+                    debug!("DNS channel {}: Received some bytes from resolver", id);
+                    let frame = Frame {
+                        header: Header {
+                            id: id,
+                            ftype: FrameType::Data,
+                            protocol: Protocol::DNS,
+                            size: nrecv as u32,
+                            dst: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
+                        },
+                        payload: buf,
+                    };
+                    if tx.send(frame).await.is_err() {
+                        warn!("DNS channel {}: Failed to send frame", id);
+                    }
+                }
+                Err(e) => {
+                    warn!("DNS channel {}: Failed to receive frame: {}", id, e)
+                }
+            }
+            break;
+        } else {
+            warn!("DNS channel {}: Failed to init DNS", id);
+        }
+    }
+    debug!("DNS channel {}: Channel closed", id);
 
-    egress
-        .connect(destination)
-        .await
-        .expect("Failed to connect to destination");
-
-    let b = rx.recv().await.expect("Failed to receive buffer");
-    egress.send(&b).await.expect("Failed to write buffer");
-
-    let mut buf = [0u8; BUFSIZE];
-    let (nrecv, _) = egress
-        .recv_from(&mut buf)
-        .await
-        .expect("Failed to receive buffer");
-    let frame = Frame {
-        header: Header {
-            id: id,
-            ftype: FrameType::Data,
-            protocol: Protocol::UDP,
-            size: nrecv as u32,
-            dst: destination,
-        },
-        payload: buf,
-    };
-    tx.send(frame).await.expect("Failed to send frame");
+    return id;
 }
 
 async fn init_remote_proxy(token: CancellationToken) {
@@ -180,7 +260,7 @@ async fn main() {
 
     task_tracker.spawn(init_remote_proxy(token));
     task_tracker.close();
-    info!("Remote proxy started.");
+    info!("Remote proxy started");
     task_tracker.wait().await;
-    info!("Remote proxy finished.");
+    info!("Remote proxy finished");
 }
