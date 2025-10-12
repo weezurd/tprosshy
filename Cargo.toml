@@ -17,6 +17,7 @@ tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = { version = "0.7.16", features = ["rt"] }
 clap = { version = "4.5.45", features = ["derive"] }
 socket2 = "0.6.0"
+resolv-conf = "0.7.5"
 
 [lib]
 name = "tprosshy"
