@@ -1,4 +1,3 @@
-use clap::Parser;
 use log::{debug, error, info, warn};
 use std::{
     collections::HashMap,
@@ -9,6 +8,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
+    process::Child,
     sync::mpsc::{Receiver, Sender},
 };
 
@@ -16,39 +16,9 @@ use crate::{
     BUFSIZE, LOCAL_TCP_PORT, LOCAL_UDP_PORT, MAX_CHANNEL,
     frame::{Frame, FrameType, Header, Protocol},
     methods::BaseMethod,
-    ssh,
     utils::{self, IOWrapper},
 };
 use tokio_util::sync::CancellationToken;
-
-/// Transparent proxy over ssh. Local proxy.
-#[derive(Parser, Debug, Clone)]
-#[command(version, about, long_about = None)]
-pub struct Args {
-    /// Remote user
-    #[arg(short, long)]
-    pub user: String,
-
-    /// Remote host. Only IPv4 is supported for now.
-    #[arg(short, long)]
-    pub host: String,
-
-    /// SSH port
-    #[arg(short, long, default_value_t = 22)]
-    pub port: u16,
-
-    /// Identity file
-    #[arg(short, long, default_value_t = String::from("~/.ssh/id_ed25519"))]
-    pub identity_file: String,
-
-    /// Allowed IP range
-    #[arg(short, long, default_value_t = String::from("0.0.0.0/0"))]
-    pub ip_range: String,
-
-    /// Enable dns proxy
-    #[arg(short, long, default_value_t = true)]
-    pub dns: bool,
-}
 
 async fn mux(
     mut egress: IOWrapper,
@@ -247,7 +217,7 @@ async fn handle_dns(
 
 pub async fn init_local_proxy(
     method: Arc<Box<dyn BaseMethod + Send + Sync>>,
-    args: Args,
+    mut ssh_proc: Child,
     token: CancellationToken,
 ) {
     let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", LOCAL_TCP_PORT))
@@ -268,15 +238,8 @@ pub async fn init_local_proxy(
         rx_pool.push((cid, _rx));
     }
 
-    let mut proc = ssh(
-        &args.user,
-        &args.host,
-        args.port,
-        &args.identity_file,
-        Some(&format!("/tmp/remote")),
-    );
-    let ssh_in = proc.stdin.take().expect("Failed to acquire stdin");
-    let ssh_out = proc.stdout.take().expect("Failed to acquire stdout");
+    let ssh_in = ssh_proc.stdin.take().expect("Failed to acquire stdin");
+    let ssh_out = ssh_proc.stdout.take().expect("Failed to acquire stdout");
     let egress = utils::IOWrapper {
         tx: utils::Tx::Child(ssh_in),
         rx: utils::Rx::Child(ssh_out),

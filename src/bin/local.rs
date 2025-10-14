@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tprosshy::{
-    Args, LOCAL_TCP_PORT, LOCAL_UDP_PORT, get_available_method, init_local_proxy, scp,
+    Args, LOCAL_TCP_PORT, LOCAL_UDP_PORT, get_available_method, init_local_proxy, scp, ssh,
     utils::{self},
 };
 
@@ -31,7 +31,17 @@ async fn main() {
     let token = CancellationToken::new();
     let task_tracker = tokio_util::task::TaskTracker::new();
 
-    task_tracker.spawn(init_local_proxy(arc_m.clone(), args.clone(), token.clone()));
+    task_tracker.spawn(init_local_proxy(
+        arc_m.clone(),
+        ssh(
+            &args.user,
+            &args.host,
+            args.port,
+            &args.identity_file,
+            Some(&format!("/tmp/remote")),
+        ),
+        token.clone(),
+    ));
     task_tracker.close();
 
     info!("Local proxy started");
