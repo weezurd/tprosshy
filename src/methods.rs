@@ -17,7 +17,6 @@ pub trait BaseMethod {
     fn setup_fw(
         &self,
         allow_ips: &str,
-        ssh_host_ip: &str,
         tcp_port: u16,
         udp_port: u16,
     ) -> Result<(), Box<dyn Error>>;

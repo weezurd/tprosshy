@@ -20,9 +20,8 @@ add chain ip tprosshy PORTAL
 add rule ip tprosshy PREROUTING counter jump PORTAL
 add rule ip tprosshy OUTPUT counter jump PORTAL
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr 127.0.0.1 return
-add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{ssh_host_ip}} return
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{allow_ips}} redirect to {{tcp_port}}
-add rule ip tprosshy PORTAL meta l4proto udp ip daddr 127.0.0.53 udp dport 53 redirect to {{udp_port}}
+# add rule ip tprosshy PORTAL meta l4proto udp ip daddr 127.0.0.53 udp dport 53 redirect to {{udp_port}}
 add rule ip tprosshy PORTAL fib daddr type local counter return
 "#
     .to_string()
@@ -42,20 +41,19 @@ impl BaseMethod for Method {
     fn setup_fw(
         &self,
         allow_ips: &str,
-        ssh_host_ip: &str,
         tcp_port: u16,
         udp_port: u16,
     ) -> Result<(), Box<dyn Error>> {
         let ruleset = RULESET_TEMPLATE
             .replace("{{allow_ips}}", allow_ips)
-            .replace("{{ssh_host_ip}}", ssh_host_ip)
             .replace("{{tcp_port}}", &tcp_port.to_string())
             .replace("{{udp_port}}", &udp_port.to_string());
 
         let mut tmp_file = NamedTempFile::new_in("/tmp")?;
         write!(tmp_file, "{}", ruleset)?;
 
-        let status = Command::new(&self.path)
+        let status = Command::new("sudo")
+            .arg(&self.path)
             .arg("-f")
             .arg(tmp_file.path())
             .status()?;
@@ -71,8 +69,8 @@ impl BaseMethod for Method {
     }
 
     fn restore_fw(&self) -> Result<(), Box<dyn Error>> {
-        let status = Command::new(&self.path)
-            .args(["delete", "table", "ip", "tprosshy"])
+        let status = Command::new("sudo")
+            .args([&self.path, "delete", "table", "ip", "tprosshy"])
             .status()?;
 
         if !status.success() {

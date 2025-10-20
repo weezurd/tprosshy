@@ -22,7 +22,7 @@ async fn main() {
     .expect("Failed to upload executable to remote");
     let arc_m = Arc::new(get_available_method());
     arc_m
-        .setup_fw(&args.ip_range, &args.host, LOCAL_TCP_PORT, LOCAL_UDP_PORT)
+        .setup_fw(&args.ip_range, LOCAL_TCP_PORT, LOCAL_UDP_PORT)
         .expect("Failed to setup firewall");
 
     let token = CancellationToken::new();
