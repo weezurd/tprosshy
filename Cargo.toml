@@ -22,3 +22,27 @@ resolv-conf = "0.7.5"
 [lib]
 name = "tprosshy"
 path = "src/lib.rs"
+
+[[bin]]
+name = "local"
+path = "src/bin/local.rs"
+
+[[bin]]
+name = "remote"
+path = "src/bin/remote.rs"
+
+[[bin]]
+name = "remote_mock"
+path = "src/bin/mock/remote.rs"
+
+[[bin]]
+name = "local_mock"
+path = "src/bin/mock/local.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/sandbox/client.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/sandbox/server.rs"
