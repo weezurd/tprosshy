@@ -24,7 +24,7 @@ pub fn init_logger(file_path: Option<String>) {
             Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
             format!(
                 "{}:{}",
-                record.file().unwrap_or("unknown"),
+                record.module_path().unwrap_or("unknown"),
                 record.line().unwrap_or(0)
             ),
             format!("[{}]", record.level()),
