@@ -249,6 +249,7 @@ pub async fn init_local_proxy(
     task_tracker.spawn(mux(egress, tx_pool, mux_rx, token.clone()));
 
     loop {
+        let mut buf = [0u8; 32];
         tokio::select! {
             Ok((ingress, _)) = tcp_listener.accept() => {
                 let orginal_dst = method
@@ -260,11 +261,17 @@ pub async fn init_local_proxy(
                     warn!("Channel exhausted");
                 }
             }
-            _ = udp_listener_guard.readable() => {
+            _ = udp_listener_guard.peek(&mut buf) => {
                 if let Some((id, rx)) = rx_pool.pop() {
-                    task_tracker.spawn(handle_dns(udp_listener_guard.clone(), mux_tx.clone(), rx, id));
+                    join_set.spawn(handle_dns(udp_listener_guard.clone(), mux_tx.clone(), rx, id));
                 } else {
-                    info!("Channel exhahsted");
+                    info!("Channel exhausted");
+                }
+            }
+            Some(res) = join_set.join_next() => {
+                match res {
+                    Ok((id, rx)) => {rx_pool.push((id, rx));}
+                    Err(e) => {warn!("Something weird happend with an underlying task: {}", e)}
                 }
             }
             _ = token.cancelled() => {
