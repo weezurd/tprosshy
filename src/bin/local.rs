@@ -14,10 +14,7 @@ async fn main() {
     // let _ssh_control_master = ssh(&args.user, &args.host, args.port, &args.identity_file, None);
     utils::init_logger(None);
     scp(
-        &args.user,
         &args.host,
-        args.port,
-        &args.identity_file,
         "target/x86_64-unknown-linux-musl/release/remote",
         "/tmp/remote",
     )
@@ -33,13 +30,7 @@ async fn main() {
 
     task_tracker.spawn(init_local_proxy(
         arc_m.clone(),
-        ssh(
-            &args.user,
-            &args.host,
-            args.port,
-            &args.identity_file,
-            Some(&format!("/tmp/remote")),
-        ),
+        ssh(&args.host, "/tmp/remote"),
         token.clone(),
     ));
     task_tracker.close();

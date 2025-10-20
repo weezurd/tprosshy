@@ -1,9 +1,11 @@
 use std::{error::Error, process::Stdio};
-
+extern crate libc;
 use tokio::process::{Child, Command};
 
 pub fn ssh(host: &str, remote_command: &str) -> Child {
     let mut cmd = Command::new("ssh");
+    cmd.uid(unsafe { libc::geteuid() })
+        .gid(unsafe { libc::getegid() });
     cmd.arg("-o");
     cmd.arg("StrictHostKeyChecking=no");
     cmd.arg("-o");
@@ -26,11 +28,16 @@ pub fn ssh(host: &str, remote_command: &str) -> Child {
 
 pub async fn scp(host: &str, local_file: &str, remote_file: &str) -> Result<(), Box<dyn Error>> {
     let output = Command::new("scp")
+        .uid(unsafe { libc::geteuid() })
+        .gid(unsafe { libc::getegid() })
         .args([
+            "-v",
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
+            "-F",
+            "/home/pdd/.ssh/config",
             local_file,
             &format!("{}:{}", host, remote_file),
         ])
