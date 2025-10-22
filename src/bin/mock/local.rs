@@ -1,11 +1,12 @@
+use log::{debug, error, info, warn};
+use std::io::{Cursor, ErrorKind};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use std::{net::SocketAddrV4, sync::Arc};
-
-use log::{debug, error, info, warn};
-use std::io::ErrorKind;
+use tokio::io::{self};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tprosshy::{
     LOCAL_TCP_PORT, LOCAL_UDP_PORT, get_available_method, init_local_proxy, scp, ssh,
@@ -48,7 +49,9 @@ async fn main() {
     task_tracker.close();
 
     // Wait for a while
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    // tokio::time::sleep(Duration::from_secs(10)).await;
+    let _ = tokio::signal::ctrl_c().await;
+    info!("Shutdown signal received. Attempt to gracefully shutdown.");
 
     token.cancel();
     task_tracker.wait().await;
@@ -58,52 +61,65 @@ async fn main() {
 
 async fn request_tcp(token: CancellationToken) {
     info!("Testing TCP request...");
-    if let Ok(mut egress) = TcpStream::connect(&DESTINATION).await {
-        let msg = b"hello_tcp";
-        if egress.write_all(msg).await.is_err() {
-            error!("Failed to write buffer");
-            return;
-        }
-        let _ = egress.flush().await;
-
+    if let Ok(egress) = TcpStream::connect(&DESTINATION).await {
         info!("Destination connected. Starting TCP loop..");
-        loop {
-            let mut buf = [0u8; BUFSIZE];
-            // tokio::time::sleep(Duration::from_millis(1000)).await;
-            tokio::select! {
-                read_result = egress.read(&mut buf) => {
-                    match read_result {
-                        Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
-                            debug!("Client disconnected. Maybe RST");
-                        }
-                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                            debug!("Client disconnected. Maybe FIN");
-                        }
-                        Err(e) => {
-                            warn!("Client disconnected. Unexpected error: {}", e);
-                        }
-                        Ok(nread) if nread == 0 => {
-                            debug!("Channel closed with EOF");
-                        }
-                        Ok(nread) => {
-                            info!("Received: {}", String::from_utf8_lossy(&buf[..nread]));
-                            if egress.write_all(msg).await.is_err() {
-                                error!("Failed to write buffer");
-                                break;
+        let (mut reader, mut writer) = io::split(egress);
+        let task_tracker = tokio_util::task::TaskTracker::new();
+
+        // Read thread
+        let t1 = token.clone();
+        task_tracker.spawn(async move {
+            loop {
+                let mut buf = [0u8; BUFSIZE];
+                tokio::select! {
+                    read_result = reader.read(&mut buf) => {
+                        match read_result {
+                            Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
+                                debug!("Client disconnected. Maybe RST");
                             }
-                            let _ = egress.flush().await;
-                            info!("Successfully write buffer");
-                            continue
+                            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                                debug!("Client disconnected. Maybe FIN");
+                            }
+                            Err(e) => {
+                                warn!("Client disconnected. Unexpected error: {}", e);
+                            }
+                            Ok(nread) if nread == 0 => {
+                                debug!("Channel closed with EOF");
+                            }
+                            Ok(nread) => {
+                                info!("Received: {:?}", &buf[..nread]);
+                                continue
+                            }
                         }
+                        break
                     }
-                    break
-                }
-                _ = token.cancelled() => {
-                    break
+                    _ = t1.cancelled() => {
+                        break
+                    }
                 }
             }
-        }
-        info!("TCP loop stopped!");
+        });
+
+        // Write thread
+        let t2 = token.clone();
+        task_tracker.spawn(async move {
+            loop {
+                let mut buffer = Cursor::new([123u8; 500 as usize]);
+                tokio::select! {
+                    write_result = writer.write_all_buf(&mut buffer) => {
+                        match write_result {
+                            Err(e) => {debug!("Failed to write: {}", e);}
+                            Ok(()) => {}
+                        }
+                    }
+                    _ = t2.cancelled() => {break}
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        task_tracker.close();
+        task_tracker.wait().await;
     } else {
         warn!("Failed to connect to destination");
     }

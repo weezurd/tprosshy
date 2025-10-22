@@ -1,6 +1,6 @@
-use std::io::ErrorKind;
-
 use log::{debug, info, warn};
+use std::io::ErrorKind;
+use tokio::io::{self};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -11,7 +11,6 @@ use tprosshy::{
     utils::{self},
 };
 const MOCK_TCP_PORT: u16 = 8068;
-const BUFSIZE: usize = usize::pow(2, 14);
 
 #[tokio::main]
 async fn main() {
@@ -25,27 +24,36 @@ async fn main() {
         .await
         .expect("Failed to bind address");
 
-    loop {
-        tokio::select! {
-            _ = init_remote_proxy(token.clone()) => {break}
-            Ok((ingress, addr)) = tcp_listener.accept() => {
-                info!("New client connected: {}", addr);
-                task_tracker.spawn(handle_tcp(ingress, token.clone()));
+    let t1 = token.clone();
+    task_tracker.spawn(async move {
+        let local_task_tracker = tokio_util::task::TaskTracker::new();
+        loop {
+            tokio::select! {
+                Ok((ingress, addr)) = tcp_listener.accept() => {
+                    info!("New client connected: {}", addr);
+                    local_task_tracker.spawn(handle_tcp(ingress, t1.clone()));
+                }
+                _ = t1.cancelled() => {break}
             }
         }
-    }
+        local_task_tracker.close();
+        local_task_tracker.wait().await;
+    });
 
+    let _ = init_remote_proxy(token.clone()).await;
     token.cancel();
     task_tracker.close();
     task_tracker.wait().await;
     info!("Remote proxy finished");
 }
 
-async fn handle_tcp(mut ingress: TcpStream, token: CancellationToken) {
+async fn handle_tcp(ingress: TcpStream, token: CancellationToken) {
+    let (mut reader, mut writer) = io::split(ingress);
+
     loop {
-        let mut buf = [0; BUFSIZE];
+        let mut buf = [0; 500];
         tokio::select! {
-            read_result = ingress.read(&mut buf) => {
+            read_result = reader.read(&mut buf) => {
                 match read_result {
                     Err(e)
                     if e.kind() == ErrorKind::ConnectionAborted
@@ -60,21 +68,18 @@ async fn handle_tcp(mut ingress: TcpStream, token: CancellationToken) {
                         warn!("Client disconnected. Unexpected error: {}", e);
                     }
                     Ok(nread) if nread == 0 => {
-                        // debug!("nread = 0. Channel closed");
+                        debug!("nread = 0. Channel closed");
                     }
                     Ok(nread) => {
-                        info!("Received: {}", str::from_utf8(&buf[..nread]).unwrap());
-                        // let n = ingress.write(&buf[..nread]).await.unwrap();
-                        match ingress.write(b"echo_hello_tcp\n").await {
-                            Ok(n) => {info!("Sent {} bytes", n)}
+                        info!("Received: {:?}", &buf[..nread]);
+                        match writer.write_all(&buf[..nread]).await {
+                            Ok(_) => {info!("Sent {} bytes", nread)}
                             Err(e) => {info!("Failed to sent: {}", e)}
                         }
-                        let _ = ingress.flush().await;
-                        info!("Sent: echo_hello_tcp");
                         continue
                     }
                 }
-                // break
+                break
             }
             _ = token.cancelled() => {break}
         }
