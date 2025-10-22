@@ -131,7 +131,8 @@ async fn handle_tcp(
                                 payload: buf
                             };
                             if tx.send(frame).await.is_err() {
-                                warn!("TCP channel {}: Failed to send frame", id);
+                                error!("TCP channel {}: Failed to send Data frame.\
+                                        Local channel might transit to stale state", id);
                                 break
                             }
                             continue
@@ -173,20 +174,18 @@ async fn handle_tcp(
                                     if tx.send(frame).await.is_err() {
                                         error!("TCP channel {}: Failed to send HalfClosed frame. \
                                                 Local channel might transit to stale state", id);
-                                        break
                                     }
                                 }
                             }
                         },
                         FrameType::HalfClosed => {
                             debug!("TCP channel {}: HalfClosed received", id);
-                            break
                         }
                         FrameType::Rst => {
                             debug!("TCP channel {}: Rst received. Doesn't expect this tho", id);
-                            break
                         }
                     }
+                    break
                 }
                 _ = token.cancelled() => {
                     break
