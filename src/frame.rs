@@ -5,7 +5,7 @@ use bincode::{Decode, Encode};
 
 use crate::BUFSIZE;
 
-#[derive(Encode, Decode, PartialEq, Debug)]
+#[derive(Encode, Decode, PartialEq, Debug, Clone, Copy)]
 pub(crate) enum FrameType {
     Data,
     HalfClosed,

@@ -106,53 +106,45 @@ async fn handle_tcp(
             let mut buf = [0u8; BUFSIZE];
             tokio::select! {
                 read_result = egress.read(&mut buf) => {
-                    match read_result {
-                        Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
+                    let (ftype, size) =  match read_result {
+                        Err(e) if e.kind() == ErrorKind::ConnectionAborted || e.kind() == ErrorKind::ConnectionReset => {
                             debug!("TCP channel {}: Client disconnected. Maybe RST", id);
+                            (FrameType::HalfClosed, 0)
                         }
                         Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                             debug!("TCP channel {}: Client disconnected. Maybe FIN", id);
+                            (FrameType::HalfClosed, 0)
                         }
                         Err(e) => {
                             warn!("TCP channel {}: Client disconnected. Unexpected error: {}", id, e);
+                            (FrameType::HalfClosed, 0)
                         }
                         Ok(nread) if nread == 0 => {
                             debug!("TCP channel {}: Channel closed with EOF", id);
+                            (FrameType::HalfClosed, 0)
                         }
                         Ok(nread) => {
-                            let frame = Frame {
-                                header: Header {
-                                    id: id,
-                                    ftype: FrameType::Data,
-                                    protocol: Protocol::TCP,
-                                    size: nread as u32,
-                                    dst: destination,
-                                },
-                                payload: buf
-                            };
-                            if tx.send(frame).await.is_err() {
-                                error!("TCP channel {}: Failed to send Data frame.\
-                                        Local channel might transit to stale state", id);
-                                break
-                            }
-                            continue
+                            (FrameType::Data, nread)
                         }
-                    }
+                    };
                     let frame = Frame {
                         header: Header {
                             id: id,
-                            ftype: FrameType::HalfClosed,
+                            ftype: ftype,
                             protocol: Protocol::TCP,
-                            size: 0,
+                            size: size as u32,
                             dst: destination,
                         },
                         payload: buf
                     };
                     if tx.send(frame).await.is_err() {
-                        error!("TCP channel {}: Failed to send HalfClosed frame. \
-                                Local channel might transit to stale state", id);
+                        error!("TCP channel {}: Failed to send {:?} frame. \
+                                Local channel might transit to stale state", id, ftype);
+                        break
                     }
-                    break
+                    if ftype == FrameType::HalfClosed {
+                        break
+                    }
                 }
                 Some(frame) = rx.recv() => {
                     match frame.header.ftype {
