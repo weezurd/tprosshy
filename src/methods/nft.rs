@@ -21,7 +21,7 @@ add rule ip tprosshy PREROUTING counter jump PORTAL
 add rule ip tprosshy OUTPUT counter jump PORTAL
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr 127.0.0.1 return
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{allow_ips}} redirect to {{tcp_port}}
-# add rule ip tprosshy PORTAL meta l4proto udp ip daddr 127.0.0.53 udp dport 53 redirect to {{udp_port}}
+add rule ip tprosshy PORTAL meta l4proto udp ip daddr 127.0.0.53 udp dport 53 redirect to {{udp_port}}
 add rule ip tprosshy PORTAL fib daddr type local counter return
 "#
     .to_string()
