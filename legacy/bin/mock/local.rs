@@ -45,6 +45,7 @@ async fn main() {
 
     // Simulate traffic
     task_tracker.spawn(request_tcp(token.clone()));
+    task_tracker.spawn(request_tcp(token.clone()));
     // task_tracker.spawn(request_dns(token.clone()));
     task_tracker.close();
 
@@ -87,7 +88,7 @@ async fn request_tcp(token: CancellationToken) {
                                 debug!("Channel closed with EOF");
                             }
                             Ok(nread) => {
-                                info!("Received: {:?}", &buf[..nread]);
+                                info!("Received: {} bytes", nread);
                                 continue
                             }
                         }
@@ -104,7 +105,7 @@ async fn request_tcp(token: CancellationToken) {
         let t2 = token.clone();
         task_tracker.spawn(async move {
             loop {
-                let mut buffer = Cursor::new([123u8; 500 as usize]);
+                let mut buffer = Cursor::new([123u8; 1 as usize]);
                 tokio::select! {
                     write_result = writer.write_all_buf(&mut buffer) => {
                         match write_result {

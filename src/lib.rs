@@ -1,21 +1,16 @@
+mod magic;
+pub use magic::{LOCAL_TCP_PORT, LOCAL_UDP_PORT};
+
 mod methods;
 pub use methods::get_available_method;
 
-mod ssh;
-pub use ssh::{scp, ssh};
+mod proxy;
+pub use proxy::init_proxy;
 
-mod magic;
-pub use magic::*;
+mod ssh;
+pub use ssh::ssh;
 
 pub mod utils;
-
-mod frame;
-
-mod local_proxy;
-pub use local_proxy::init_local_proxy;
-
-mod remote_proxy;
-pub use remote_proxy::init_remote_proxy;
 
 use clap::Parser;
 
@@ -32,6 +27,10 @@ pub struct Args {
     pub ip_range: String,
 
     /// Enable dns proxy
-    #[arg(short, long, default_value_t = true)]
+    #[arg(short, long, default_value_t = false)]
     pub dns: bool,
+
+    /// Enable dns proxy
+    #[arg(short, long, default_value_t = 1080)]
+    pub dynamic_port: u16,
 }

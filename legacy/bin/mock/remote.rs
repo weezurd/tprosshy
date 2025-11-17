@@ -71,7 +71,6 @@ async fn handle_tcp(ingress: TcpStream, token: CancellationToken) {
                         debug!("nread = 0. Channel closed");
                     }
                     Ok(nread) => {
-                        info!("Received: {:?}", &buf[..nread]);
                         match writer.write_all(&buf[..nread]).await {
                             Ok(_) => {info!("Sent {} bytes", nread)}
                             Err(e) => {info!("Failed to sent: {}", e)}

@@ -18,31 +18,12 @@ tokio-util = { version = "0.7.16", features = ["rt"] }
 clap = { version = "4.5.45", features = ["derive"] }
 socket2 = "0.6.0"
 resolv-conf = "0.7.5"
+fast-socks5 = "0.10.0"
 
 [lib]
 name = "tprosshy"
 path = "src/lib.rs"
 
 [[bin]]
-name = "local"
-path = "src/bin/local.rs"
-
-[[bin]]
-name = "remote"
-path = "src/bin/remote.rs"
-
-[[bin]]
-name = "remote_mock"
-path = "src/bin/mock/remote.rs"
-
-[[bin]]
-name = "local_mock"
-path = "src/bin/mock/local.rs"
-
-[[bin]]
-name = "client"
-path = "src/bin/sandbox/client.rs"
-
-[[bin]]
-name = "server"
-path = "src/bin/sandbox/server.rs"
+name = "tprosshy"
+path = "src/bin/main.rs"

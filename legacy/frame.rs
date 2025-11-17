@@ -6,6 +6,7 @@ use bincode::{Decode, Encode};
 use crate::BUFSIZE;
 
 #[derive(Encode, Decode, PartialEq, Debug, Clone, Copy)]
+#[repr(u8)]
 pub(crate) enum FrameType {
     Data,
     HalfClosed,
@@ -13,6 +14,7 @@ pub(crate) enum FrameType {
 }
 
 #[derive(Encode, Decode, PartialEq, Debug)]
+#[repr(u8)]
 pub(crate) enum Protocol {
     TCP,
     DNS,
