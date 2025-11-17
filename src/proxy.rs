@@ -1,4 +1,4 @@
-use log::warn;
+use log::{info, warn};
 use std::{net::SocketAddrV4, sync::Arc};
 use tokio::{
     io::copy_bidirectional,
@@ -52,7 +52,13 @@ async fn handle_tcp(
     )
     .await
     {
-        let result = copy_bidirectional(&mut stream, &mut remote).await;
+        info!("New connection opened. Destination: {}", destination);
+        tokio::select! {
+            _ = copy_bidirectional(&mut stream, &mut remote) => {}
+            _ = token.cancelled() => {
+                return
+            }
+        }
     } else {
         warn!("Failed to init connection to socks5 server");
     }

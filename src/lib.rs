@@ -11,6 +11,7 @@ mod ssh;
 pub use ssh::ssh;
 
 pub mod utils;
+pub use utils::init_logger;
 
 use clap::Parser;
 
@@ -19,11 +20,11 @@ use clap::Parser;
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// SSH config host.
-    #[arg(short, long)]
+    #[arg(short = 'H', long)]
     pub host: String,
 
     /// Allowed IP range
-    #[arg(short, long, default_value_t = String::from("0.0.0.0/0"))]
+    #[arg(long = "ip", default_value_t = String::from("0.0.0.0/0"))]
     pub ip_range: String,
 
     /// Enable dns proxy
@@ -31,6 +32,6 @@ pub struct Args {
     pub dns: bool,
 
     /// Enable dns proxy
-    #[arg(short, long, default_value_t = 1080)]
+    #[arg(long, default_value_t = 1080)]
     pub dynamic_port: u16,
 }

@@ -6,10 +6,13 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
-use tprosshy::{Args, LOCAL_TCP_PORT, LOCAL_UDP_PORT, get_available_method, init_proxy, ssh};
+use tprosshy::{
+    Args, LOCAL_TCP_PORT, LOCAL_UDP_PORT, get_available_method, init_logger, init_proxy, ssh,
+};
 
 #[tokio::main]
 async fn main() {
+    init_logger(None);
     let args: Args = Args::parse();
     let arc_m = Arc::new(get_available_method());
     arc_m
