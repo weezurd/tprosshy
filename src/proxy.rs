@@ -62,4 +62,5 @@ async fn handle_tcp(
     } else {
         warn!("Failed to init connection to socks5 server");
     }
+    info!("Connection closed.");
 }
