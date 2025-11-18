@@ -1,8 +1,5 @@
-mod magic;
-pub use magic::{LOCAL_TCP_PORT, LOCAL_UDP_PORT};
-
 mod methods;
-pub use methods::get_available_method;
+pub use methods::get_available_net_tool;
 
 mod proxy;
 pub use proxy::init_proxy;

@@ -5,7 +5,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use crate::{LOCAL_TCP_PORT, methods::BaseMethod};
+use crate::methods::BaseMethod;
 use fast_socks5::client::Socks5Stream;
 use tokio_util::sync::CancellationToken;
 
@@ -13,12 +13,9 @@ pub async fn init_proxy(
     method: Arc<Box<dyn BaseMethod + Send + Sync>>,
     token: CancellationToken,
     socks_addr: SocketAddrV4,
+    tcp_listener: TcpListener,
 ) {
-    let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", LOCAL_TCP_PORT))
-        .await
-        .expect("Failed to bind address");
     let task_tracker = tokio_util::task::TaskTracker::new();
-
     loop {
         tokio::select! {
             Ok((ingress, _)) = tcp_listener.accept() => {

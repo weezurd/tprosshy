@@ -38,16 +38,10 @@ impl Method {
 }
 
 impl BaseMethod for Method {
-    fn setup_fw(
-        &self,
-        allow_ips: &str,
-        tcp_port: u16,
-        udp_port: u16,
-    ) -> Result<(), Box<dyn Error>> {
+    fn setup_fw(&self, allow_ips: &str, tcp_port: u16) -> Result<(), Box<dyn Error>> {
         let ruleset = RULESET_TEMPLATE
             .replace("{{allow_ips}}", allow_ips)
-            .replace("{{tcp_port}}", &tcp_port.to_string())
-            .replace("{{udp_port}}", &udp_port.to_string());
+            .replace("{{tcp_port}}", &tcp_port.to_string());
 
         let mut tmp_file = NamedTempFile::new_in("/tmp")?;
         write!(tmp_file, "{}", ruleset)?;
