@@ -29,7 +29,6 @@ async fn main() {
         .setup_fw(&args.ip_range, binding_addr.port())
         .expect("Failed to setup firewall");
     task_tracker.spawn(init_proxy(
-        net_tool.clone(),
         token.clone(),
         SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), args.dynamic_port),
         tcp_listener,

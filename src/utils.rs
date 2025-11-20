@@ -4,6 +4,7 @@ use env_logger::Env;
 use log::warn;
 use resolv_conf::Config;
 use resolv_conf::ScopedIp;
+use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -61,4 +62,13 @@ pub fn get_system_resolvers() -> Vec<SocketAddrV4> {
     }
 
     return dns_resolvers;
+}
+
+pub fn get_original_dst(sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>> {
+    let dst_addr_v4 = sock_ref
+        .original_dst_v4()
+        .expect("Failed to get orginal destination")
+        .as_socket_ipv4()
+        .expect("Failed to convert original destination to ipv4");
+    return Ok(dst_addr_v4);
 }

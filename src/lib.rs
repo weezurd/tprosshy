@@ -8,7 +8,7 @@ mod ssh;
 pub use ssh::ssh;
 
 pub mod utils;
-pub use utils::init_logger;
+pub use utils::{get_original_dst, init_logger};
 
 use clap::Parser;
 

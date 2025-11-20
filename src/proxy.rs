@@ -1,16 +1,15 @@
-use log::{info, warn};
-use std::{net::SocketAddrV4, sync::Arc};
+use log::{error, info, warn};
+use std::net::SocketAddrV4;
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
 };
 
-use crate::methods::BaseMethod;
+use crate::get_original_dst;
 use fast_socks5::client::Socks5Stream;
 use tokio_util::sync::CancellationToken;
 
 pub async fn init_proxy(
-    method: Arc<Box<dyn BaseMethod + Send + Sync>>,
     token: CancellationToken,
     socks_addr: SocketAddrV4,
     tcp_listener: TcpListener,
@@ -19,10 +18,7 @@ pub async fn init_proxy(
     loop {
         tokio::select! {
             Ok((ingress, _)) = tcp_listener.accept() => {
-                let orginal_dst = method
-                    .get_original_dst(socket2::SockRef::from(&ingress))
-                    .expect("Failed to get orignal destination");
-                task_tracker.spawn(handle_tcp(ingress, orginal_dst, token.clone(), socks_addr));
+                task_tracker.spawn(handle_tcp(ingress, token.clone(), socks_addr));
             }
             _ = token.cancelled() => {
                 task_tracker.close();
@@ -33,23 +29,23 @@ pub async fn init_proxy(
     }
 }
 
-async fn handle_tcp(
-    mut stream: TcpStream,
-    destination: SocketAddrV4,
-    token: CancellationToken,
-    socks_addr: SocketAddrV4,
-) {
-    let mut remote_config = fast_socks5::client::Config::default();
-    remote_config.set_skip_auth(false);
+async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_addr: SocketAddrV4) {
+    let dst = match get_original_dst(socket2::SockRef::from(&stream)) {
+        Ok(addr) => addr,
+        Err(_) => {
+            error!("Failed to get original destination of NAT-ed address");
+            return;
+        }
+    };
     if let Ok(mut remote) = Socks5Stream::connect(
         socks_addr,
-        destination.ip().to_string(),
-        destination.port(),
-        remote_config,
+        dst.ip().to_string(),
+        dst.port(),
+        fast_socks5::client::Config::default(),
     )
     .await
     {
-        info!("New connection opened. Destination: {}", destination);
+        info!("New connection opened. Destination: {}", dst);
         tokio::select! {
             _ = copy_bidirectional(&mut stream, &mut remote) => {}
             _ = token.cancelled() => {
