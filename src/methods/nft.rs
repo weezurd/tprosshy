@@ -1,8 +1,6 @@
-use super::{BaseMethod, get_original_dst};
+use super::{BaseMethod, MethodError};
 use once_cell::sync::Lazy;
-use std::error::Error;
 use std::io::Write;
-use std::net::SocketAddrV4;
 use std::process::Command;
 use tempfile::NamedTempFile;
 pub struct Method {
@@ -38,46 +36,44 @@ impl Method {
 }
 
 impl BaseMethod for Method {
-    fn setup_fw(&self, allow_ips: &str, tcp_port: u16) -> Result<(), Box<dyn Error>> {
+    fn setup_fw(&self, allow_ips: &str, tcp_port: u16) -> Result<(), MethodError> {
         let ruleset = RULESET_TEMPLATE
             .replace("{{allow_ips}}", allow_ips)
             .replace("{{tcp_port}}", &tcp_port.to_string());
 
-        let mut tmp_file = NamedTempFile::new_in("/tmp")?;
-        write!(tmp_file, "{}", ruleset)?;
-
-        let status = Command::new("sudo")
-            .arg(&self.path)
-            .arg("-f")
-            .arg(tmp_file.path())
-            .status()?;
-
-        if !status.success() {
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "nft command failed",
-            )))
+        if let Ok(mut tmp_file) = NamedTempFile::new_in("/tmp")
+            && let Ok(_) = write!(tmp_file, "{}", ruleset)
+            && let Some(tmp_file_path) = tmp_file.path().to_str()
+        {
+            if let Ok(status) = Command::new("sudo")
+                .args([&self.path, "-f", tmp_file_path])
+                .status()
+                && status.success()
+            {
+                return Ok(());
+            } else {
+                return Err(MethodError::SetupError(String::from(
+                    "Failed to setup nft table",
+                )));
+            }
         } else {
-            Ok(())
+            return Err(MethodError::SetupError(String::from(
+                "Failed to setup temp file for nft table",
+            )));
         }
     }
 
-    fn restore_fw(&self) -> Result<(), Box<dyn Error>> {
-        let status = Command::new("sudo")
+    fn restore_fw(&self) -> Result<(), MethodError> {
+        if let Ok(status) = Command::new("sudo")
             .args([&self.path, "delete", "table", "ip", "tprosshy"])
-            .status()?;
-
-        if !status.success() {
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "restore command failed",
-            )))
+            .status()
+            && status.success()
+        {
+            return Ok(());
         } else {
-            Ok(())
+            return Err(MethodError::RestoreError(String::from(
+                "Failed to delete nft table",
+            )));
         }
-    }
-
-    fn get_original_dst(&self, sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>> {
-        get_original_dst(sock_ref)
     }
 }

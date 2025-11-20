@@ -1,22 +1,28 @@
 mod nft;
-
-use socket2;
 use std::error::Error;
-use std::net::SocketAddrV4;
 
-fn get_original_dst(sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>> {
-    let dst_addr_v4 = sock_ref
-        .original_dst_v4()
-        .expect("Failed to get orginal destination")
-        .as_socket_ipv4()
-        .expect("Failed to convert original destination to ipv4");
-    return Ok(dst_addr_v4);
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
+#[derive(Debug)]
+pub enum MethodError {
+    SetupError(String),
+    RestoreError(String),
 }
 
+impl Display for MethodError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            MethodError::SetupError(e) => write!(f, "{}", e),
+            MethodError::RestoreError(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl Error for MethodError {}
+
 pub trait BaseMethod {
-    fn setup_fw(&self, allow_ips: &str, tcp_port: u16) -> Result<(), Box<dyn Error>>;
-    fn restore_fw(&self) -> Result<(), Box<dyn Error>>;
-    fn get_original_dst(&self, sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>>;
+    fn setup_fw(&self, allow_ips: &str, tcp_port: u16) -> Result<(), MethodError>;
+    fn restore_fw(&self) -> Result<(), MethodError>;
 }
 
 pub fn get_available_net_tool() -> Box<dyn BaseMethod + Send + Sync> {
