@@ -18,7 +18,7 @@ async fn main() {
     let token = CancellationToken::new();
     let task_tracker = tokio_util::task::TaskTracker::new();
 
-    let _ = ssh(&args.host, args.dynamic_port);
+    let mut ssh_proc = ssh(&args.host, args.dynamic_port);
     let tcp_listener = TcpListener::bind("0.0.0.0:0")
         .await
         .expect("Failed to bind address");
@@ -45,5 +45,6 @@ async fn main() {
     token.cancel();
     task_tracker.wait().await;
     net_tool.restore_fw().expect("Failed to restore firewall");
+    ssh_proc.kill().await.expect("Failed to kill ssh process");
     info!("Proxy server finished");
 }
