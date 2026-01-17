@@ -1,9 +1,6 @@
 use clap::Parser;
 use log::info;
-use std::{
-    net::{Ipv4Addr, SocketAddrV4},
-    sync::Arc,
-};
+use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 
 use tokio_util::sync::CancellationToken;
