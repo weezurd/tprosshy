@@ -1,6 +1,6 @@
 **TODO**
 - [ ] Tracing to profile / improve performance
-- [ ] Tests
+- [ ] Optimize DNS proxy
 - [ ] Ipv6?
 
 ## TCP
