@@ -1,14 +1,12 @@
 use chrono::Local;
 use env_logger;
 use env_logger::Env;
-use log::warn;
-use resolv_conf::Config;
-use resolv_conf::ScopedIp;
 use std::error::Error;
-use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddrV4;
+
+pub const DNS_BUFSIZE: usize = 1024;
 
 pub fn init_logger(file_path: Option<String>) {
     let env = Env::default().filter_or("RUST_LOG", "info");
@@ -42,26 +40,6 @@ pub fn init_logger(file_path: Option<String>) {
     }
 
     logger.init();
-}
-
-pub fn get_system_resolvers() -> Vec<SocketAddrV4> {
-    let mut dns_resolvers: Vec<SocketAddrV4> = vec![];
-    if let Ok(content) = fs::read("/etc/resolv.conf")
-        && let Ok(config) = Config::parse(&content)
-    {
-        for ns in config.nameservers {
-            match ns {
-                ScopedIp::V4(addr) => {
-                    dns_resolvers.push(SocketAddrV4::new(addr, 53));
-                }
-                _ => {
-                    warn!("Found IPv6 nameserver. Only Ipv4 is supported for now")
-                }
-            }
-        }
-    }
-
-    return dns_resolvers;
 }
 
 pub fn get_original_dst(sock_ref: socket2::SockRef) -> Result<SocketAddrV4, Box<dyn Error>> {
