@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 
 use tokio_util::sync::CancellationToken;
 use tprosshy::{Args, get_available_net_tool, init_logger, init_proxy, ssh};
@@ -18,33 +18,44 @@ async fn main() {
     let token = CancellationToken::new();
     let task_tracker = tokio_util::task::TaskTracker::new();
 
-    let mut ssh_proc = ssh(&args.host, args.dynamic_port);
     let tcp_listener = TcpListener::bind("0.0.0.0:0")
         .await
         .expect("Failed to bind address");
-    let binding_addr = tcp_listener
+    let tcp_binding_addr = tcp_listener
         .local_addr()
         .expect("Failed to bind address for tcp listener");
+    let dns_listener = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .expect("Failed to bind address");
+    let udp_binding_addr = dns_listener
+        .local_addr()
+        .expect("Failed to bind address for udp listener");
     net_tool
-        .setup_fw(&args.ip_range, binding_addr.port())
+        .setup_fw(
+            &args.ip_range,
+            tcp_binding_addr.port(),
+            udp_binding_addr.port(),
+        )
         .expect("Failed to setup firewall");
     task_tracker.spawn(init_proxy(
         token.clone(),
-        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), args.dynamic_port),
         tcp_listener,
+        dns_listener,
+        args.socks_port,
+        args.host,
     ));
     task_tracker.close();
 
     info!(
-        "Proxy server started. TCP port: {}. SOCKS5 port: {}",
-        binding_addr.port(),
-        args.dynamic_port
+        "Proxy server started. TCP port: {}. UDP port: {}. SOCKS5 port: {}",
+        tcp_binding_addr.port(),
+        udp_binding_addr.port(),
+        args.socks_port
     );
     let _ = tokio::signal::ctrl_c().await;
     info!("Shutdown signal received. Attempt to gracefully shutdown...");
     token.cancel();
     task_tracker.wait().await;
     net_tool.restore_fw().expect("Failed to restore firewall");
-    ssh_proc.kill().await.expect("Failed to kill ssh process");
     info!("Proxy server finished");
 }

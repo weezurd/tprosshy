@@ -21,7 +21,7 @@ impl Display for MethodError {
 impl Error for MethodError {}
 
 pub trait BaseMethod {
-    fn setup_fw(&self, allow_ips: &str, tcp_port: u16) -> Result<(), MethodError>;
+    fn setup_fw(&self, allow_ips: &str, tcp_port: u16, udp_port: u16) -> Result<(), MethodError>;
     fn restore_fw(&self) -> Result<(), MethodError>;
 }
 
