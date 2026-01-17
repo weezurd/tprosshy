@@ -28,7 +28,7 @@ pub struct Args {
     #[arg(short, long, default_value_t = false)]
     pub dns: bool,
 
-    /// Enable dns proxy
+    /// Socks port
     #[arg(long, default_value_t = 1080)]
-    pub dynamic_port: u16,
+    pub socks_port: u16,
 }
