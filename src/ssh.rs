@@ -2,7 +2,12 @@ use std::process::Stdio;
 extern crate libc;
 use tokio::process::{Child, Command};
 
-pub fn ssh(host: &str, socks_port: Option<u16>, remote_command: Option<String>) -> Child {
+pub fn ssh(
+    host: &str,
+    socks_port: Option<u16>,
+    remote_command: Option<String>,
+    local_portforwarding: Option<String>,
+) -> Child {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o");
     cmd.arg("StrictHostKeyChecking=no");
@@ -20,6 +25,10 @@ pub fn ssh(host: &str, socks_port: Option<u16>, remote_command: Option<String>) 
     if let Some(port) = socks_port {
         cmd.arg("-D");
         cmd.arg(port.to_string());
+    }
+    if let Some(pf) = local_portforwarding {
+        cmd.arg("-L");
+        cmd.arg(pf);
     }
     if let Some(rc) = remote_command {
         cmd.arg(&rc);
