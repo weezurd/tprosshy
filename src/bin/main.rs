@@ -10,6 +10,9 @@ use tprosshy::{Args, get_available_net_tool, init_logger, init_proxy, ssh};
 async fn main() {
     init_logger(None);
     let args: Args = Args::parse();
+    if args.tracing {
+        console_subscriber::init();
+    }
     let net_tool = Arc::new(get_available_net_tool());
 
     let token = CancellationToken::new();
