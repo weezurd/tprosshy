@@ -7,14 +7,16 @@
 - TCP segment size is somewhat unpredictable due to several factors. Ref: https://datatracker.ietf.org/doc/html/rfc9293#name-segmentation. This behavior might need to be considered when implement tcp listener.
 
 ## Command snippet
-- Switch namespace to `local-server`:
+- Run proxy:
 ```
-sudo nsenter -t $(docker inspect --format '{{.State.Pid}}' local-server) -n /bin/sh -c 'sudo su pdd'
+cargo run -- --host [SSH CONFIG HOST] --ip [CIDR]
 ```
-- Build `local` and `remote` proxy:
-```
-cargo build --release --target x86_64-unknown-linux-musl --bin remote && cargo build --release --bin local
-```
+- Run proxy with tracing:
+    - Run proxy with additional flag and option:
+    ```
+    RUSTFLAGS="--cfg tokio_unstable" cargo run -- --host [SSH CONFIG HOST] --ip [CIDR] --tracing
+    ```
+    - In another terminal, run `tokio-console`:
 
 ## Dev note
 - Always flush if underlying IO is buffered
