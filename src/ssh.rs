@@ -1,5 +1,4 @@
 use std::process::Stdio;
-extern crate libc;
 use tokio::process::{Child, Command};
 
 pub fn ssh(
