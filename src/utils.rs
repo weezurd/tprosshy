@@ -6,8 +6,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddrV4;
 
-pub const DNS_BUFSIZE: usize = 1024;
-
 pub fn init_logger(file_path: Option<String>) {
     let env = Env::default().filter_or("RUST_LOG", "info");
     let mut logger = env_logger::Builder::from_env(env);

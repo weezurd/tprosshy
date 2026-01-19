@@ -1,29 +1,16 @@
 use log::{error, info, warn};
-use once_cell::sync::Lazy;
-use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::{
-    io::{AsyncReadExt, copy_bidirectional},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
-use crate::{get_original_dst, ssh, utils::DNS_BUFSIZE};
-use domain::{base::Message, rdata::Aaaa};
+use crate::{get_original_dst, ssh};
 use fast_socks5::client::Socks5Stream;
 use tokio_util::sync::CancellationToken;
 
-use domain::base::MessageBuilder;
-use domain::base::iana::Rcode;
-use domain::rdata::rfc1035::A;
-
-static DNS_SERVFAIL: Lazy<Vec<u8>> = Lazy::new(|| {
-    let mut builder = MessageBuilder::new_vec();
-    builder.header_mut().set_qr(true);
-    builder.header_mut().set_rcode(Rcode::SERVFAIL);
-    return builder.finish().into();
-});
+const LOCAL_DNS_PORT: u16 = 5353;
+const DNS_BUFSIZE: usize = 1024;
 
 pub async fn init_proxy(
     token: CancellationToken,
@@ -34,8 +21,23 @@ pub async fn init_proxy(
 ) {
     let task_tracker = tokio_util::task::TaskTracker::new();
     let mut buf = [0u8; DNS_BUFSIZE];
-    let mut ssh_proc = ssh(&remote_host, Some(socks_port), None);
-    let leaked_remote_host = remote_host.leak();
+    let remote_nameserver = get_remote_nameserver(&remote_host).await;
+    if remote_nameserver.is_none() {
+        warn!(
+            "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf"
+        );
+        return;
+    }
+    let mut ssh_proc = ssh(
+        &remote_host,
+        Some(socks_port),
+        None,
+        Some(format!(
+            "{}:{}:53",
+            LOCAL_DNS_PORT,
+            remote_nameserver.unwrap()
+        )),
+    );
     let leaked_dns_listener = Box::leak(Box::new(dns_listener));
 
     loop {
@@ -45,7 +47,7 @@ pub async fn init_proxy(
             }
             Ok((buflen, addr)) = leaked_dns_listener.recv_from(&mut buf) => {
                 if buflen < DNS_BUFSIZE {
-                    task_tracker.spawn(handle_dns(buf, buflen, addr, leaked_remote_host, leaked_dns_listener));
+                    task_tracker.spawn(handle_dns(buf, buflen, addr, leaked_dns_listener));
                 } else {
                     warn!("Skipped big DNS request.");
                 }
@@ -62,140 +64,107 @@ pub async fn init_proxy(
     }
 }
 
-fn forge_dns_response(
-    dns_request: Message<&[u8]>,
-    hostmap: &HashMap<String, Vec<String>>,
-) -> Vec<u8> {
-    let mut builder = MessageBuilder::new_vec();
+async fn get_remote_nameserver(remote_host: &str) -> Option<IpAddr> {
+    let mut child = ssh(
+        remote_host,
+        None,
+        Some(String::from(
+            r#"awk '$1 == "nameserver" {print $2; exit}' /etc/resolv.conf"#,
+        )),
+        None,
+    );
 
-    // Header
-    let header = builder.header_mut();
-    header.set_id(dns_request.header().id());
-    header.set_qr(true);
-    header.set_rd(dns_request.header().rd());
-    header.set_ra(true);
-    header.set_rcode(Rcode::NOERROR);
-
-    // Questions (REQUIRED)
-    let mut question_builder = builder.question();
-    for q in dns_request.question() {
-        if let Ok(q_entry) = q {
-            if question_builder.push(q_entry).is_err() {
-                question_builder.header_mut().set_rcode(Rcode::SERVFAIL);
-                return question_builder.finish().into();
-            }
-        }
+    let mut raw_ip_addr = String::new();
+    if let Some(mut child_stdout) = child.stdout.take().map(tokio::io::BufReader::new)
+        && let Err(e) = child_stdout.read_line(&mut raw_ip_addr).await
+    {
+        warn!("Failed to read ssh process stdout: {}", e);
+        return None;
     }
 
-    // Answers
-    let mut answer_builder = question_builder.answer();
-    let ttl = 60;
-
-    for q in dns_request.question() {
-        if let Ok(q_entry) = q
-            && let Some(ips) = hostmap.get(&q_entry.qname().to_string())
-        {
-            for ip_str in ips {
-                let result = if let Ok(ipv4) = ip_str.parse::<std::net::Ipv4Addr>() {
-                    answer_builder.push((q_entry.qname(), ttl, A::new(ipv4)))
-                } else if let Ok(ipv6) = ip_str.parse::<std::net::Ipv6Addr>() {
-                    answer_builder.push((q_entry.qname(), ttl, Aaaa::new(ipv6)))
-                } else {
-                    continue;
-                };
-
-                if result.is_err() {
-                    answer_builder.header_mut().set_rcode(Rcode::SERVFAIL);
-                    return answer_builder.finish().into();
-                }
-            }
-        } else {
-            answer_builder.header_mut().set_rcode(Rcode::NXDOMAIN);
-        }
+    if let Err(e) = child.kill().await {
+        warn!("Failed to kill ssh process: {}", e)
     }
 
-    answer_builder.finish().into()
+    let ip_str = raw_ip_addr.trim();
+    if ip_str.is_empty() {
+        warn!("No nameserver found in remote /etc/resolv.conf");
+        return None;
+    }
+
+    match ip_str.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            warn!("Failed to parse remote nameserver IP '{}': {}", ip_str, e);
+            None
+        }
+    }
 }
 
 async fn handle_dns(
     buf: [u8; DNS_BUFSIZE],
     buflen: usize,
     addr: SocketAddr,
-    remote_host: &str,
     dns_socket: &UdpSocket,
 ) {
-    let dns_request = match Message::from_octets(&buf[..buflen]) {
-        Ok(msg) => msg,
+    let mut tcp_payload = Vec::with_capacity(buflen + 2);
+    tcp_payload.extend_from_slice(&(buflen as u16).to_be_bytes());
+    tcp_payload.extend_from_slice(&buf[..buflen]);
+
+    let send_servfail = || async {
+        let mut response = Vec::with_capacity(buflen);
+
+        let mut header = [0u8; 12];
+        header[0..2].copy_from_slice(&buf[0..2]); // Transaction ID
+        header[2] = 0x81; // Flags: Response, OpCode 0, RD 1
+        header[3] = 0x82; // Flags: RA 1, RCODE 2 (SERVFAIL)
+        header[4..6].copy_from_slice(&buf[4..6]); // Echo the original QDCOUNT
+
+        response.extend_from_slice(&header);
+
+        // Attach the Question Section
+        if buflen >= 12 {
+            response.extend_from_slice(&buf[12..buflen]);
+        }
+
+        let _ = dns_socket.send_to(&response, addr).await;
+    };
+
+    let stream_result = TcpStream::connect(format!("127.0.0.1:{}", LOCAL_DNS_PORT)).await;
+    match stream_result {
+        Ok(mut stream) => {
+            if let Err(e) = stream.write_all(&tcp_payload).await {
+                warn!("Failed to write to DNS tunnel: {}", e);
+                send_servfail().await;
+                return;
+            }
+
+            let mut len_buf = [0u8; 2];
+            if let Err(e) = stream.read_exact(&mut len_buf).await {
+                warn!("Failed to read DNS response length: {}", e);
+                send_servfail().await;
+                return;
+            }
+
+            let mut dns_response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+            if let Err(e) = stream.read_exact(&mut dns_response).await {
+                warn!("Failed to read DNS response body: {}", e);
+                send_servfail().await;
+                return;
+            }
+
+            if let Err(e) = dns_socket.send_to(&dns_response, addr).await {
+                warn!("Failed to send UDP response back to client: {}", e);
+            }
+        }
         Err(e) => {
-            warn!("Failed to parse dns request: {}", e);
-            if let Err(e) = dns_socket.send_to(&DNS_SERVFAIL, addr).await {
-                warn!("Failed to send dns response: {}", e)
-            }
-            return;
+            warn!(
+                "Could not connect to LOCAL_DNS_PORT {}: {}",
+                LOCAL_DNS_PORT, e
+            );
+            send_servfail().await;
         }
     };
-
-    let request_domains: Vec<String> = dns_request
-        .question()
-        .filter(|x| !x.is_err())
-        .map(|x| x.unwrap().qname().clone().to_string())
-        .collect();
-
-    if request_domains.len() == 0 {
-        warn!("Failed to extract request domains from question section");
-        return;
-    }
-
-    info!(
-        "Command: {}",
-        format!("getent hosts {}", request_domains.join(" "))
-    );
-    let mut child_stdout = match ssh(
-        remote_host,
-        None,
-        Some(format!("getent hosts {}", request_domains.join(" "))),
-    )
-    .stdout
-    {
-        Some(x) => x,
-        None => {
-            warn!("Failed to get ssh process stdout");
-            if let Err(e) = dns_socket.send_to(&DNS_SERVFAIL, addr).await {
-                warn!("Failed to send dns response: {}", e)
-            }
-            return;
-        }
-    };
-
-    let mut raw_response = vec![];
-    if let Ok(len) = child_stdout.read_to_end(&mut raw_response).await
-        && let Ok(resp_str) = String::from_utf8(raw_response[..len].to_vec())
-    {
-        let mut hostmap = HashMap::new();
-        for line in resp_str.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-
-            if parts.len() >= 2 {
-                let ip = parts[0].to_string();
-
-                // Everything from index 1 onwards is a valid hostname/alias for this IP
-                for i in 1..parts.len() {
-                    let hostname = parts[i].to_string();
-                    hostmap
-                        .entry(hostname)
-                        .or_insert_with(Vec::new)
-                        .push(ip.clone());
-                }
-            }
-        }
-
-        let dns_response = forge_dns_response(dns_request, &hostmap);
-        if let Err(e) = dns_socket.send_to(&dns_response, addr).await {
-            warn!("Failed to send dns response: {}", e)
-        }
-    } else {
-        warn!("Failed to read ssh process stdout")
-    }
 }
 
 async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port: u16) {
