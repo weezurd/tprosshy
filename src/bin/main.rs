@@ -12,6 +12,7 @@ async fn main() {
     let args: Args = Args::parse();
     if args.tracing {
         console_subscriber::init();
+        info!("Console subscriber initialized");
     }
     let net_tool = Arc::new(get_available_net_tool());
 
@@ -52,10 +53,17 @@ async fn main() {
         udp_binding_addr.port(),
         args.socks_port
     );
-    let _ = tokio::signal::ctrl_c().await;
-    info!("Shutdown signal received. Attempt to gracefully shutdown...");
-    token.cancel();
-    task_tracker.wait().await;
-    net_tool.restore_fw().expect("Failed to restore firewall");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutdown signal received. Attempt to gracefully shutdown...");
+            token.cancel();
+            task_tracker.wait().await;
+            net_tool.restore_fw().expect("Failed to restore firewall");
+        }
+        _ = task_tracker.wait() => {
+            net_tool.restore_fw().expect("Failed to restore firewall");
+        }
+    };
     info!("Proxy server finished");
 }

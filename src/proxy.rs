@@ -21,23 +21,33 @@ pub async fn init_proxy(
 ) {
     let task_tracker = tokio_util::task::TaskTracker::new();
     let mut buf = [0u8; DNS_BUFSIZE];
-    let remote_nameserver = get_remote_nameserver(&remote_host).await;
-    if remote_nameserver.is_none() {
-        warn!(
-            "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf"
-        );
-        return;
-    }
-    let mut ssh_proc = ssh(
+    let remote_nameserver = match get_remote_nameserver(&remote_host).await {
+        Some(x) => x,
+        None => {
+            warn!(
+                "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf"
+            );
+            return;
+        }
+    };
+
+    let mut ssh_proc = match ssh(
         &remote_host,
         Some(socks_port),
         None,
-        Some(format!(
-            "{}:{}:53",
-            LOCAL_DNS_PORT,
-            remote_nameserver.unwrap()
-        )),
-    );
+        Some(format!("{}:{}:53", LOCAL_DNS_PORT, remote_nameserver)),
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err(e) => {
+            warn!(
+                "Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
+                e, remote_host
+            );
+            return;
+        }
+    };
     let leaked_dns_listener = Box::leak(Box::new(dns_listener));
 
     loop {
@@ -65,37 +75,48 @@ pub async fn init_proxy(
 }
 
 async fn get_remote_nameserver(remote_host: &str) -> Option<IpAddr> {
-    let mut child = ssh(
+    match ssh(
         remote_host,
         None,
         Some(String::from(
             r#"awk '$1 == "nameserver" {print $2; exit}' /etc/resolv.conf"#,
         )),
         None,
-    );
-
-    let mut raw_ip_addr = String::new();
-    if let Some(mut child_stdout) = child.stdout.take().map(tokio::io::BufReader::new)
-        && let Err(e) = child_stdout.read_line(&mut raw_ip_addr).await
+    )
+    .await
     {
-        warn!("Failed to read ssh process stdout: {}", e);
-        return None;
-    }
+        Ok(mut child) => {
+            let mut raw_ip_addr = String::new();
+            if let Some(mut child_stdout) = child.stdout.take().map(tokio::io::BufReader::new)
+                && let Err(e) = child_stdout.read_line(&mut raw_ip_addr).await
+            {
+                warn!("Failed to read ssh process stdout: {}", e);
+                return None;
+            }
 
-    if let Err(e) = child.kill().await {
-        warn!("Failed to kill ssh process: {}", e)
-    }
+            if let Err(e) = child.kill().await {
+                warn!("Failed to kill ssh process: {}", e)
+            }
 
-    let ip_str = raw_ip_addr.trim();
-    if ip_str.is_empty() {
-        warn!("No nameserver found in remote /etc/resolv.conf");
-        return None;
-    }
+            let ip_str = raw_ip_addr.trim();
+            if ip_str.is_empty() {
+                warn!("No nameserver found in remote /etc/resolv.conf");
+                return None;
+            }
 
-    match ip_str.parse::<IpAddr>() {
-        Ok(ip) => Some(ip),
+            match ip_str.parse::<IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    warn!("Failed to parse remote nameserver IP '{}': {}", ip_str, e);
+                    None
+                }
+            }
+        }
         Err(e) => {
-            warn!("Failed to parse remote nameserver IP '{}': {}", ip_str, e);
+            warn!(
+                "Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
+                e, remote_host
+            );
             None
         }
     }
