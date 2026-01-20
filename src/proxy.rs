@@ -1,7 +1,7 @@
 use log::{error, info, warn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
@@ -153,22 +153,26 @@ async fn handle_dns(
 
     let stream_result = TcpStream::connect(format!("127.0.0.1:{}", LOCAL_DNS_PORT)).await;
     match stream_result {
-        Ok(mut stream) => {
-            if let Err(e) = stream.write_all(&tcp_payload).await {
+        Ok(stream) => {
+            if let Err(e) = stream.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY: {}", e);
+            }
+            let mut buffered_stream = BufReader::new(stream);
+            if let Err(e) = buffered_stream.write_all(&tcp_payload).await {
                 warn!("Failed to write to DNS tunnel: {}", e);
                 send_servfail().await;
                 return;
             }
 
             let mut len_buf = [0u8; 2];
-            if let Err(e) = stream.read_exact(&mut len_buf).await {
+            if let Err(e) = buffered_stream.read_exact(&mut len_buf).await {
                 warn!("Failed to read DNS response length: {}", e);
                 send_servfail().await;
                 return;
             }
 
             let mut dns_response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
-            if let Err(e) = stream.read_exact(&mut dns_response).await {
+            if let Err(e) = buffered_stream.read_exact(&mut dns_response).await {
                 warn!("Failed to read DNS response body: {}", e);
                 send_servfail().await;
                 return;
