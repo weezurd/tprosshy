@@ -1,7 +1,7 @@
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
-pub fn ssh(
+pub(crate) fn ssh(
     host: &str,
     socks_port: Option<u16>,
     remote_command: Option<String>,

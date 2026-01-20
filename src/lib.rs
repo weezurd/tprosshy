@@ -5,7 +5,7 @@ mod proxy;
 pub use proxy::init_proxy;
 
 mod ssh;
-pub use ssh::ssh;
+use ssh::ssh;
 
 pub mod utils;
 pub use utils::{get_original_dst, init_logger};

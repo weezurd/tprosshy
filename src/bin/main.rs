@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 
 use tokio_util::sync::CancellationToken;
-use tprosshy::{Args, get_available_net_tool, init_logger, init_proxy, ssh};
+use tprosshy::{Args, get_available_net_tool, init_logger, init_proxy};
 
 #[tokio::main]
 async fn main() {
