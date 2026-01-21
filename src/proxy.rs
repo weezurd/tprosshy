@@ -1,5 +1,8 @@
 use log::{error, info, warn};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -7,7 +10,7 @@ use tokio::{
 
 use crate::{get_original_dst, ssh};
 use fast_socks5::client::Socks5Stream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const LOCAL_DNS_PORT: u16 = 5353;
@@ -49,37 +52,25 @@ pub async fn init_proxy(
             return;
         }
     };
-    let leaked_dns_listener = Box::leak(Box::new(dns_listener));
+
+    let dns_listener_rx = Arc::new(dns_listener);
+    let dns_listener_tx = dns_listener_rx.clone();
 
     let (tx, rx) = mpsc::channel(1);
-    task_tracker.spawn(dns_connection_manager(
-        rx,
-        format!("127.0.0.1:{}", LOCAL_DNS_PORT),
-    ));
+    task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx));
 
     loop {
         tokio::select! {
             Ok((ingress, _)) = tcp_listener.accept() => {
                 task_tracker.spawn(handle_tcp(ingress, token.clone(), socks_port));
             }
-            Ok((buflen, addr)) = leaked_dns_listener.recv_from(&mut buf) => {
+            Ok((buflen, addr)) = dns_listener_rx.recv_from(&mut buf) => {
                 if buflen < DNS_BUFSIZE {
                     // task_tracker.spawn(handle_dns(buf, buflen, addr, leaked_dns_listener));
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    if let Err(_) = tx.send(DnsCmd::Query { data: buf[..buflen].to_vec(), resp_tx: resp_tx }).await {
-                        warn!("Failed to send DNS command to connection manager");
+                    if let Err(e) = tx.send(DnsCmd::Query { data: buf[..buflen].to_vec(), addr }).await {
+                        warn!("Failed to send DNS command to connection manager: {}", e);
                         continue
                     }
-
-                    match resp_rx.await {
-                        Ok(x) => {
-                            if let Err(e) = leaked_dns_listener.send_to(&x, addr).await {
-                                warn!("Failed to send UDP response back to client: {}", e);
-                            }
-                        }
-                        Err(e) => {warn!("Failed to received DNS result: {}", e)}
-                    }
-
                 } else {
                     warn!("Skipped big DNS request.");
                 }
@@ -144,76 +135,6 @@ async fn get_remote_nameserver(remote_host: &str) -> Option<IpAddr> {
     }
 }
 
-async fn handle_dns(
-    buf: [u8; DNS_BUFSIZE],
-    buflen: usize,
-    addr: SocketAddr,
-    dns_socket: &UdpSocket,
-) {
-    let mut tcp_payload = Vec::with_capacity(buflen + 2);
-    tcp_payload.extend_from_slice(&(buflen as u16).to_be_bytes());
-    tcp_payload.extend_from_slice(&buf[..buflen]);
-
-    let send_servfail = || async {
-        let mut response = Vec::with_capacity(buflen);
-
-        let mut header = [0u8; 12];
-        header[0..2].copy_from_slice(&buf[0..2]); // Transaction ID
-        header[2] = 0x81; // Flags: Response, OpCode 0, RD 1
-        header[3] = 0x82; // Flags: RA 1, RCODE 2 (SERVFAIL)
-        header[4..6].copy_from_slice(&buf[4..6]); // Echo the original QDCOUNT
-
-        response.extend_from_slice(&header);
-
-        // Attach the Question Section
-        if buflen >= 12 {
-            response.extend_from_slice(&buf[12..buflen]);
-        }
-
-        let _ = dns_socket.send_to(&response, addr).await;
-    };
-
-    let stream_result = TcpStream::connect(format!("127.0.0.1:{}", LOCAL_DNS_PORT)).await;
-    match stream_result {
-        Ok(stream) => {
-            if let Err(e) = stream.set_nodelay(true) {
-                warn!("Failed to set TCP_NODELAY: {}", e);
-            }
-            let mut buffered_stream = BufReader::new(stream);
-            if let Err(e) = buffered_stream.write_all(&tcp_payload).await {
-                warn!("Failed to write to DNS tunnel: {}", e);
-                send_servfail().await;
-                return;
-            }
-
-            let mut len_buf = [0u8; 2];
-            if let Err(e) = buffered_stream.read_exact(&mut len_buf).await {
-                warn!("Failed to read DNS response length: {}", e);
-                send_servfail().await;
-                return;
-            }
-
-            let mut dns_response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
-            if let Err(e) = buffered_stream.read_exact(&mut dns_response).await {
-                warn!("Failed to read DNS response body: {}", e);
-                send_servfail().await;
-                return;
-            }
-
-            if let Err(e) = dns_socket.send_to(&dns_response, addr).await {
-                warn!("Failed to send UDP response back to client: {}", e);
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Could not connect to LOCAL_DNS_PORT {}: {}",
-                LOCAL_DNS_PORT, e
-            );
-            send_servfail().await;
-        }
-    };
-}
-
 async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port: u16) {
     let dst = match get_original_dst(socket2::SockRef::from(&stream)) {
         Ok(addr) => addr,
@@ -247,61 +168,76 @@ async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port:
 }
 
 enum DnsCmd {
-    Query {
-        data: Vec<u8>,
-        resp_tx: oneshot::Sender<Vec<u8>>,
-    },
+    Query { data: Vec<u8>, addr: SocketAddr },
 }
 
-async fn dns_connection_manager(mut rx: mpsc::Receiver<DnsCmd>, addr: String) {
-    let mut stream: Option<TcpStream> = None;
+fn create_servfail(buf: &[u8], buflen: usize) -> Vec<u8> {
+    let mut response = Vec::with_capacity(buflen);
+
+    let mut header = [0u8; 12];
+    header[0..2].copy_from_slice(&buf[0..2]); // Transaction ID
+    header[2] = 0x81; // Flags: Response, OpCode 0, RD 1
+    header[3] = 0x82; // Flags: RA 1, RCODE 2 (SERVFAIL)
+    header[4..6].copy_from_slice(&buf[4..6]); // Echo the original QDCOUNT
+
+    response.extend_from_slice(&header);
+
+    // Attach the Question Section
+    if buflen >= 12 {
+        response.extend_from_slice(&buf[12..buflen]);
+    }
+
+    return response;
+}
+
+async fn handle_dns(
+    token: CancellationToken,
+    mut rx: mpsc::Receiver<DnsCmd>,
+    dns_listener_tx: Arc<UdpSocket>,
+) {
+    let mut stream = match TcpStream::connect(&format!("127.0.0.1:{}", LOCAL_DNS_PORT)).await {
+        Ok(s) => {
+            let _ = s.set_nodelay(true);
+            s
+        }
+        Err(e) => {
+            warn!("Failed to connect to dns server: {}", e);
+            token.cancel();
+            return;
+        }
+    };
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            DnsCmd::Query { data, resp_tx } => {
-                // 1. Ensure connected
-                if stream.is_none() {
-                    // Internal: Connect implies sending SSH_MSG_CHANNEL_OPEN (The 230ms hit)
-                    // We only want to do this ONCE.
-                    match TcpStream::connect(&addr).await {
-                        Ok(s) => {
-                            let _ = s.set_nodelay(true); // Crucial for latency
-                            stream = Some(s);
-                        }
-                        Err(_) => {
-                            let _ = resp_tx.send(vec![]); // Fail
-                            continue;
-                        }
-                    }
+            DnsCmd::Query { data, addr } => {
+                let len = (data.len() as u16).to_be_bytes();
+                if stream.write_all(&len).await.is_err() || stream.write_all(&data).await.is_err() {
+                    warn!("Failed to make DNS request");
+                    token.cancel();
+                    let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                    return;
                 }
 
-                if let Some(ref mut s) = stream {
-                    // 2. Send Length + Data
-                    let len = (data.len() as u16).to_be_bytes();
-                    if s.write_all(&len).await.is_err() || s.write_all(&data).await.is_err() {
-                        // Connection died, drop it and retry/fail
-                        stream = None;
-                        // ideally you would retry connection here once
-                        continue;
-                    }
+                let mut resp_len_buf = [0u8; 2];
+                if let Err(e) = stream.read_exact(&mut resp_len_buf).await {
+                    warn!("Failed to read DNS response length: {}", e);
+                    token.cancel();
+                    let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                    return;
+                }
+                let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                if let Err(e) = stream.read_exact(&mut resp_buf).await {
+                    warn!("Failed to read DNS response: {}", e);
+                    token.cancel();
+                    let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                    return;
+                }
 
-                    // 3. Read Response
-                    // Note: This logic blocks other queries. Ideally, split Read/Write
-                    // into two tasks if you want full pipelining.
-                    let mut len_buf = [0u8; 2];
-                    if s.read_exact(&mut len_buf).await.is_err() {
-                        stream = None;
-                        continue;
-                    }
-                    let resp_len = u16::from_be_bytes(len_buf) as usize;
-                    let mut resp_buf = vec![0u8; resp_len];
-                    if s.read_exact(&mut resp_buf).await.is_err() {
-                        stream = None;
-                        continue;
-                    }
-
-                    info!("DNS result sent");
-                    let _ = resp_tx.send(resp_buf);
+                if let Err(e) = dns_listener_tx.send_to(&resp_buf, addr).await {
+                    warn!("Failed to send DNS response back to client: {}", e);
+                    token.cancel();
+                    return;
                 }
             }
         }
