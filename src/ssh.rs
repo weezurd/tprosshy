@@ -1,4 +1,4 @@
-use log::warn;
+use log::{info, warn};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -43,12 +43,8 @@ pub(crate) async fn ssh(
         cmd.arg("-N");
     }
 
-    let mut child = match cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped()) // Capture stderr to debug connection issues
-        .spawn()
-    {
+    info!("Spawning command: {:?}", cmd);
+    let mut child = match cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() {
         Ok(x) => x,
         Err(e) => {
             return Err(format!("Failed to spawn child process: {}", e));

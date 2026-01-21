@@ -7,6 +7,7 @@ use tokio::{
 
 use crate::{get_original_dst, ssh};
 use fast_socks5::client::Socks5Stream;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const LOCAL_DNS_PORT: u16 = 5353;
@@ -50,6 +51,12 @@ pub async fn init_proxy(
     };
     let leaked_dns_listener = Box::leak(Box::new(dns_listener));
 
+    let (tx, rx) = mpsc::channel(1);
+    task_tracker.spawn(dns_connection_manager(
+        rx,
+        format!("127.0.0.1:{}", LOCAL_DNS_PORT),
+    ));
+
     loop {
         tokio::select! {
             Ok((ingress, _)) = tcp_listener.accept() => {
@@ -57,7 +64,22 @@ pub async fn init_proxy(
             }
             Ok((buflen, addr)) = leaked_dns_listener.recv_from(&mut buf) => {
                 if buflen < DNS_BUFSIZE {
-                    task_tracker.spawn(handle_dns(buf, buflen, addr, leaked_dns_listener));
+                    // task_tracker.spawn(handle_dns(buf, buflen, addr, leaked_dns_listener));
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    if let Err(_) = tx.send(DnsCmd::Query { data: buf[..buflen].to_vec(), resp_tx: resp_tx }).await {
+                        warn!("Failed to send DNS command to connection manager");
+                        continue
+                    }
+
+                    match resp_rx.await {
+                        Ok(x) => {
+                            if let Err(e) = leaked_dns_listener.send_to(&x, addr).await {
+                                warn!("Failed to send UDP response back to client: {}", e);
+                            }
+                        }
+                        Err(e) => {warn!("Failed to received DNS result: {}", e)}
+                    }
+
                 } else {
                     warn!("Skipped big DNS request.");
                 }
@@ -222,4 +244,66 @@ async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port:
         }
     }
     info!("Connection closed.");
+}
+
+enum DnsCmd {
+    Query {
+        data: Vec<u8>,
+        resp_tx: oneshot::Sender<Vec<u8>>,
+    },
+}
+
+async fn dns_connection_manager(mut rx: mpsc::Receiver<DnsCmd>, addr: String) {
+    let mut stream: Option<TcpStream> = None;
+
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            DnsCmd::Query { data, resp_tx } => {
+                // 1. Ensure connected
+                if stream.is_none() {
+                    // Internal: Connect implies sending SSH_MSG_CHANNEL_OPEN (The 230ms hit)
+                    // We only want to do this ONCE.
+                    match TcpStream::connect(&addr).await {
+                        Ok(s) => {
+                            let _ = s.set_nodelay(true); // Crucial for latency
+                            stream = Some(s);
+                        }
+                        Err(_) => {
+                            let _ = resp_tx.send(vec![]); // Fail
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(ref mut s) = stream {
+                    // 2. Send Length + Data
+                    let len = (data.len() as u16).to_be_bytes();
+                    if s.write_all(&len).await.is_err() || s.write_all(&data).await.is_err() {
+                        // Connection died, drop it and retry/fail
+                        stream = None;
+                        // ideally you would retry connection here once
+                        continue;
+                    }
+
+                    // 3. Read Response
+                    // Note: This logic blocks other queries. Ideally, split Read/Write
+                    // into two tasks if you want full pipelining.
+                    let mut len_buf = [0u8; 2];
+                    if s.read_exact(&mut len_buf).await.is_err() {
+                        stream = None;
+                        continue;
+                    }
+                    let resp_len = u16::from_be_bytes(len_buf) as usize;
+                    let mut resp_buf = vec![0u8; resp_len];
+                    if s.read_exact(&mut resp_buf).await.is_err() {
+                        stream = None;
+                        continue;
+                    }
+
+                    info!("DNS result sent");
+                    let _ = resp_tx.send(resp_buf);
+                }
+            }
+        }
+    }
 }
