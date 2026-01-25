@@ -53,13 +53,6 @@ pub(crate) async fn ssh(
 
     for i in 0..RETRY {
         sleep(Duration::from_millis(3000)).await;
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "SSH process exited prematurely with status: {}",
-                status
-            ));
-        }
-
         if let Ok(output) = Command::new("ssh")
             .arg("-o")
             .arg(format!("ControlPath={}", control_path))
