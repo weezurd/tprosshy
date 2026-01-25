@@ -31,13 +31,6 @@ async fn main() {
     let udp_binding_addr = dns_listener
         .local_addr()
         .expect("Failed to bind address for udp listener");
-    net_tool
-        .setup_fw(
-            &args.ip_range,
-            tcp_binding_addr.port(),
-            udp_binding_addr.port(),
-        )
-        .expect("Failed to setup firewall");
     task_tracker.spawn(init_proxy(
         token.clone(),
         tcp_listener,
@@ -45,6 +38,13 @@ async fn main() {
         args.socks_port,
         args.host,
     ));
+    net_tool
+        .setup_fw(
+            &args.ip_range,
+            tcp_binding_addr.port(),
+            udp_binding_addr.port(),
+        )
+        .expect("Failed to setup firewall");
     task_tracker.close();
 
     info!(
