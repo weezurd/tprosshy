@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
@@ -58,6 +58,13 @@ pub async fn init_proxy(
 
     let (tx, rx) = mpsc::channel(1);
     task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx));
+
+    info!(
+        "Proxy server started. TCP listener address: {}. DNS listener address: {}. SOCKS5 port: {}",
+        tcp_listener.local_addr().unwrap(),
+        dns_listener_rx.local_addr().unwrap(),
+        socks_port
+    );
 
     loop {
         tokio::select! {
@@ -196,10 +203,7 @@ async fn handle_dns(
     dns_listener_tx: Arc<UdpSocket>,
 ) {
     let mut stream = match TcpStream::connect(&format!("127.0.0.1:{}", LOCAL_DNS_PORT)).await {
-        Ok(s) => {
-            let _ = s.set_nodelay(true);
-            s
-        }
+        Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to dns server: {}", e);
             token.cancel();

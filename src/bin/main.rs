@@ -47,13 +47,6 @@ async fn main() {
         .expect("Failed to setup firewall");
     task_tracker.close();
 
-    info!(
-        "Proxy server started. TCP port: {}. UDP port: {}. SOCKS5 port: {}",
-        tcp_binding_addr.port(),
-        udp_binding_addr.port(),
-        args.socks_port
-    );
-
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Shutdown signal received. Attempt to gracefully shutdown...");
