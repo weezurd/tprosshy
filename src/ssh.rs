@@ -11,6 +11,7 @@ pub(crate) async fn ssh(
     socks_port: Option<u16>,
     remote_command: Option<String>,
     local_portforwarding: Option<String>,
+    check_connection: bool,
 ) -> Result<Child, String> {
     let control_path = format!("/tmp/tprosshy-cm-{}", host.replace('@', "-"));
     let mut cmd = Command::new("ssh");
@@ -39,35 +40,43 @@ pub(crate) async fn ssh(
     cmd.arg(host);
     if let Some(rc) = remote_command {
         cmd.arg(rc);
-    } else {
-        cmd.arg("-N");
     }
 
     info!("Spawning command: {:?}", cmd);
-    let mut child = match cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() {
+    let mut ssh_proc = match cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() {
         Ok(x) => x,
         Err(e) => {
             return Err(format!("Failed to spawn child process: {}", e));
         }
     };
 
-    for i in 0..RETRY {
-        sleep(Duration::from_millis(3000)).await;
-        if let Ok(output) = Command::new("ssh")
-            .arg("-o")
-            .arg(format!("ControlPath={}", control_path))
-            .arg("-O")
-            .arg("check")
-            .arg(host)
-            .output()
-            .await
-            && output.status.success()
-        {
-            return Ok(child);
+    if check_connection {
+        for i in 0..RETRY {
+            sleep(Duration::from_millis(3000)).await;
+            match Command::new("ssh")
+                .arg("-o")
+                .arg(format!("ControlPath={}", control_path))
+                .arg("-O")
+                .arg("check")
+                .arg(host)
+                .output()
+                .await
+            {
+                Ok(x) => {
+                    if x.status.success() {
+                        return Ok(ssh_proc);
+                    }
+                    warn!("Waiting for SSH connection... (attempt {})", i + 1);
+                }
+                Err(e) => {
+                    warn!("Failed to check ssh connection: {} (attempt {})", e, i + 1)
+                }
+            }
         }
-        warn!("Waiting for SSH connection... (attempt {})", i + 1);
-    }
 
-    let _ = child.kill().await;
-    Err(format!("SSH connection timed out after {} attempts", RETRY))
+        let _ = ssh_proc.kill().await;
+        Err(format!("SSH connection timed out after {} attempts", RETRY))
+    } else {
+        return Ok(ssh_proc);
+    }
 }
