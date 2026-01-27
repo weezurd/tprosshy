@@ -1,10 +1,11 @@
 use domain::base::{Message, MessageBuilder, Name, iana::Rcode};
 use log::{error, info, warn};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
+    vec,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader, copy_bidirectional},
@@ -16,7 +17,6 @@ use fast_socks5::client::Socks5Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const LOCAL_DNS_PORT: u16 = 5353;
 const DNS_BUFSIZE: usize = 1024;
 
 pub async fn init_proxy(
@@ -29,24 +29,7 @@ pub async fn init_proxy(
     let remote_host: &'static str = remote_host.leak();
     let task_tracker = tokio_util::task::TaskTracker::new();
     let mut buf = [0u8; DNS_BUFSIZE];
-    let remote_nameserver = match get_remote_nameserver(&remote_host).await {
-        Some(x) => x,
-        None => {
-            warn!(
-                "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf"
-            );
-            return;
-        }
-    };
-
-    let mut ssh_proc = match ssh(
-        &remote_host,
-        Some(socks_port),
-        None,
-        Some(format!("{}:{}:53", LOCAL_DNS_PORT, remote_nameserver)),
-    )
-    .await
-    {
+    let mut ssh_proc = match ssh(&remote_host, Some(socks_port), None, None, true).await {
         Ok(x) => x,
         Err(e) => {
             warn!(
@@ -94,54 +77,6 @@ pub async fn init_proxy(
                 }
                 break
             }
-        }
-    }
-}
-
-async fn get_remote_nameserver(remote_host: &str) -> Option<IpAddr> {
-    match ssh(
-        remote_host,
-        None,
-        Some(String::from(
-            r#"awk '$1 == "nameserver" {print $2; exit}' /etc/resolv.conf"#,
-        )),
-        None,
-    )
-    .await
-    {
-        Ok(mut child) => {
-            let mut raw_ip_addr = String::new();
-            if let Some(mut child_stdout) = child.stdout.take().map(tokio::io::BufReader::new)
-                && let Err(e) = child_stdout.read_line(&mut raw_ip_addr).await
-            {
-                warn!("Failed to read ssh process stdout: {}", e);
-                return None;
-            }
-
-            if let Err(e) = child.kill().await {
-                warn!("Failed to kill ssh process: {}", e)
-            }
-
-            let ip_str = raw_ip_addr.trim();
-            if ip_str.is_empty() {
-                warn!("No nameserver found in remote /etc/resolv.conf");
-                return None;
-            }
-
-            match ip_str.parse::<IpAddr>() {
-                Ok(ip) => Some(ip),
-                Err(e) => {
-                    warn!("Failed to parse remote nameserver IP '{}': {}", ip_str, e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
-                e, remote_host
-            );
-            None
         }
     }
 }
@@ -204,9 +139,14 @@ fn create_servfail(buf: &[u8], buflen: usize) -> Vec<u8> {
 fn create_dns_response(
     request: &Message<&Vec<u8>>,
     qname_str: &str,
-    ips: &[String],
+    ips: &[IpAddr],
 ) -> Result<Vec<u8>, ()> {
-    let mut response = match MessageBuilder::new_vec().start_answer(request, Rcode::NOERROR) {
+    let rcode = match ips.len() {
+        0 => Rcode::SERVFAIL,
+        _ => Rcode::NOERROR,
+    };
+
+    let mut response = match MessageBuilder::new_vec().start_answer(request, rcode) {
         Ok(r) => r,
         Err(_) => return Err(()),
     };
@@ -219,15 +159,13 @@ fn create_dns_response(
         }
     };
 
-    for ip_str in ips {
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    let _ = response.push((&domain_name, 300, domain::rdata::A::new(v4)));
-                }
-                IpAddr::V6(v6) => {
-                    let _ = response.push((&domain_name, 300, domain::rdata::Aaaa::new(v6)));
-                }
+    for ip in ips {
+        match ip {
+            IpAddr::V4(v4) => {
+                let _ = response.push((&domain_name, 300, domain::rdata::A::new(*v4)));
+            }
+            IpAddr::V6(v6) => {
+                let _ = response.push((&domain_name, 300, domain::rdata::Aaaa::new(*v6)));
             }
         }
     }
@@ -237,54 +175,52 @@ fn create_dns_response(
 
 async fn update_record_table(
     remote_host: &str,
-    record_table: &mut HashMap<String, Vec<String>>,
+    record_table: &mut HashMap<String, Vec<IpAddr>>,
     domain_name: &str,
-) -> Option<IpAddr> {
-    match ssh(
+) {
+    let start = std::time::Instant::now();
+    let mut ssh_proc = match ssh(
         remote_host,
         None,
-        Some(format!("getent ahosts {}", domain_name)),
+        Some(format!("getent ahosts {} | grep DGRAM", domain_name)),
         None,
+        false,
     )
     .await
     {
-        Ok(mut child) => {
-            let stdout = child.stdout.take()?;
-            let mut reader = BufReader::new(stdout).lines();
-
-            // Use a HashSet internally to prevent duplicate IPs in the Vec
-            let mut unique_ips = HashSet::new();
-            let mut first_ip: Option<IpAddr> = None;
-
-            while let Ok(Some(line)) = reader.next_line().await {
-                // getent ahosts format: <IP> <SOCK_TYPE> <CANONICAL_NAME>
-                if let Some(ip_str) = line.split_whitespace().next() {
-                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                        // Set the primary return value if this is the first valid IP
-                        if first_ip.is_none() {
-                            first_ip = Some(ip);
-                        }
-                        // Add to our set to filter out duplicates from different socket types
-                        unique_ips.insert(ip_str.to_string());
-                    }
-                }
-            }
-
-            if !unique_ips.is_empty() {
-                // Convert HashSet to Vec and update the table
-                record_table.insert(remote_host.to_string(), unique_ips.into_iter().collect());
-            }
-
-            first_ip
-        }
+        Ok(x) => x,
         Err(e) => {
             warn!(
                 "Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
                 e, remote_host
             );
-            None
+            return;
+        }
+    };
+    info!("Actual DNS request took: {}", start.elapsed().as_millis());
+
+    let stdout = match ssh_proc.stdout.take() {
+        Some(x) => x,
+        None => {
+            warn!("Failed to take stdout from ssh process");
+            return;
+        }
+    };
+
+    let mut reader = BufReader::new(stdout).lines();
+    let mut ips = vec![];
+
+    let start = std::time::Instant::now();
+    while let Ok(Some(line)) = reader.next_line().await {
+        // getent ahosts format: <IP> <SOCK_TYPE> <CANONICAL_NAME>
+        if let Some(ip_str) = line.split_whitespace().next()
+            && let Ok(ip) = ip_str.parse::<IpAddr>()
+        {
+            ips.push(ip);
         }
     }
+    info!("Reading DNS response took: {}", start.elapsed().as_millis());
+    record_table.insert(domain_name.to_string(), ips);
 }
 
 async fn handle_dns(
@@ -294,9 +230,10 @@ async fn handle_dns(
     remote_host: &str,
 ) {
     let mut record_table = HashMap::new();
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            DnsCmd::Query { data, addr } => {
+
+    loop {
+        tokio::select! {
+            Some(DnsCmd::Query { data, addr }) = rx.recv() => {
                 let dns_request = match Message::from_octets(&data) {
                     Ok(m) => m,
                     Err(e) => {
@@ -323,17 +260,19 @@ async fn handle_dns(
                 let ips = match record_table.get(&qname) {
                     Some(v) => v,
                     None => {
+                        let start = std::time::Instant::now();
                         update_record_table(remote_host, &mut record_table, &qname).await;
+                        info!("Update record table took: {}", start.elapsed().as_millis());
+
                         match record_table.get(&qname) {
                             Some(v) => v,
                             None => {
-                                warn!("Failed to resolve DNS qname");
+                                warn!("Failed to resolve DNS qname: {}", &qname);
                                 let _ = dns_listener_tx
                                     .send_to(&create_servfail(&data, data.len()), addr);
                                 continue;
                             }
-                        };
-                        continue;
+                        }
                     }
                 };
 
@@ -347,6 +286,9 @@ async fn handle_dns(
                         continue;
                     }
                 }
+            }
+            _ = token.cancelled() => {
+                return;
             }
         }
     }
