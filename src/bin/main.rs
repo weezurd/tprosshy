@@ -31,13 +31,6 @@ async fn main() {
     let udp_binding_addr = dns_listener
         .local_addr()
         .expect("Failed to bind address for udp listener");
-    task_tracker.spawn(init_proxy(
-        token.clone(),
-        tcp_listener,
-        dns_listener,
-        args.socks_port,
-        args.host,
-    ));
     net_tool
         .setup_fw(
             &args.ip_range,
@@ -45,6 +38,13 @@ async fn main() {
             udp_binding_addr.port(),
         )
         .expect("Failed to setup firewall");
+    task_tracker.spawn(init_proxy(
+        token.clone(),
+        tcp_listener,
+        dns_listener,
+        args.socks_port,
+        args.host,
+    ));
     task_tracker.close();
 
     tokio::select! {
