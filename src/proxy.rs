@@ -8,15 +8,16 @@ use std::{
     vec,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader, copy_bidirectional},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
-use crate::{get_original_dst, ssh};
+use crate::{get_original_dst, get_remote_nameserver, ssh};
 use fast_socks5::client::Socks5Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+const LOCAL_DNS_PORT: u16 = 5353;
 const DNS_BUFSIZE: usize = 1024;
 
 pub async fn init_proxy(
@@ -29,7 +30,26 @@ pub async fn init_proxy(
     let remote_host: &'static str = remote_host.leak();
     let task_tracker = tokio_util::task::TaskTracker::new();
     let mut buf = [0u8; DNS_BUFSIZE];
-    let mut ssh_proc = match ssh(&remote_host, Some(socks_port), None, None, true).await {
+
+    let remote_nameserver = match get_remote_nameserver(&remote_host).await {
+        Some(x) => x,
+        None => {
+            warn!(
+                "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf"
+            );
+            return;
+        }
+    };
+
+    let mut ssh_proc = match ssh(
+        &remote_host,
+        Some(socks_port),
+        None,
+        Some(format!("{}:{}:53", LOCAL_DNS_PORT, remote_nameserver)),
+        true,
+    )
+    .await
+    {
         Ok(x) => x,
         Err(e) => {
             warn!(
@@ -44,7 +64,13 @@ pub async fn init_proxy(
     let dns_listener_tx = dns_listener_rx.clone();
 
     let (tx, rx) = mpsc::channel(1);
-    task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx, &remote_host));
+    // task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx, &remote_host));
+    task_tracker.spawn(handle_dns_2(
+        token.clone(),
+        rx,
+        dns_listener_tx,
+        &remote_host,
+    ));
 
     info!(
         "Proxy server started. TCP listener address: {}. DNS listener address: {}. SOCKS5 port: {}",
@@ -284,6 +310,97 @@ async fn handle_dns(
                         warn!("Failed to create dns response");
                         let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
                         continue;
+                    }
+                }
+            }
+            _ = token.cancelled() => {
+                return;
+            }
+        }
+    }
+}
+
+async fn update_record_table_2(
+    remote_host: &str,
+    record_table: &mut HashMap<String, Vec<IpAddr>>,
+    domain_name: &str,
+) {
+    let mut stream = TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await;
+
+    let mut tcp_payload = Vec::with_capacity(data.len() + 2);
+    tcp_payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    tcp_payload.extend_from_slice(&data);
+    if let Err(e) = stream.write_all(&tcp_payload).await {
+        warn!("Failed to make DNS request");
+        return;
+    }
+
+    let mut len_buf = [0u8; 2];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+        stream = None;
+        continue;
+    }
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+    let mut resp_buf = vec![0u8; resp_len];
+    if stream.read_exact(&mut resp_buf).await.is_err() {
+        stream = None;
+        continue;
+    }
+
+    if let Err(e) = dns_listener_tx.send_to(&resp_buf, addr).await {
+        warn!("Failed to send UDP response back to client: {}", e);
+    }
+}
+
+async fn handle_dns_2(
+    token: CancellationToken,
+    mut rx: mpsc::Receiver<DnsCmd>,
+    dns_listener_tx: Arc<UdpSocket>,
+    remote_host: &str,
+) {
+    // let mut record_table = HashMap::new();
+
+    let mut stream: Option<TcpStream> = None;
+
+    loop {
+        tokio::select! {
+            Some(DnsCmd::Query { data, addr }) = rx.recv() => {
+                if stream.is_none() {
+                    // Internal: Connect implies sending SSH_MSG_CHANNEL_OPEN (The 230ms hit)
+                    // We only want to do this ONCE.
+                    stream = match TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await {
+                        Ok(s) => {Some(s)}
+                        Err(_) => {
+                            warn!("Failed to connect to DNS server");
+                            let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                            continue;
+                        }
+                    }
+                }
+
+                let mut tcp_payload = Vec::with_capacity(data.len() + 2);
+                tcp_payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                tcp_payload.extend_from_slice(&data);
+                if let Some(ref mut s) = stream {
+                    if s.write_all(&tcp_payload).await.is_err() {
+                        stream = None;
+                        continue;
+                    }
+
+                    let mut len_buf = [0u8; 2];
+                    if s.read_exact(&mut len_buf).await.is_err() {
+                        stream = None;
+                        continue;
+                    }
+                    let resp_len = u16::from_be_bytes(len_buf) as usize;
+                    let mut resp_buf = vec![0u8; resp_len];
+                    if s.read_exact(&mut resp_buf).await.is_err() {
+                        stream = None;
+                        continue;
+                    }
+
+                    if let Err(e) = dns_listener_tx.send_to(&resp_buf, addr).await {
+                        warn!("Failed to send UDP response back to client: {}", e);
                     }
                 }
             }
