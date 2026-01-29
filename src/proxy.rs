@@ -1,4 +1,4 @@
-use domain::base::{Message, MessageBuilder, Name, iana::Rcode};
+use domain::base::{Message, MessageBuilder, Name, iana::Rcode, record::ComposeRecord};
 use log::{error, info, warn};
 use std::{
     collections::HashMap,
@@ -320,36 +320,64 @@ async fn handle_dns(
     }
 }
 
+fn build_response_from_request(
+    dns_request: &Message<Vec<u8>>, // The new incoming query
+    cached_msg: &Message<Vec<u8>>,  // Your stored response
+) -> Result<Vec<u8>, ()> {
+    let mut response = match MessageBuilder::new_vec().start_answer(dns_request, Rcode::NOERROR) {
+        Ok(r) => r,
+        Err(_) => return Err(()),
+    };
+
+    response
+    // for record in cached_msg.answer() {
+    //     response.push(record.into());
+    // }
+
+    Ok(response.finish().into())
+}
+
 async fn update_record_table_2(
-    remote_host: &str,
-    record_table: &mut HashMap<String, Vec<IpAddr>>,
+    record_table: &mut HashMap<String, Message<Vec<u8>>>,
     domain_name: &str,
+    data: &[u8],
 ) {
-    let mut stream = TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await;
+    let mut stream = match TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to connect to DNS server: {}", e);
+            return;
+        }
+    };
 
     let mut tcp_payload = Vec::with_capacity(data.len() + 2);
     tcp_payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
     tcp_payload.extend_from_slice(&data);
     if let Err(e) = stream.write_all(&tcp_payload).await {
-        warn!("Failed to make DNS request");
+        warn!("Failed to make DNS request: {}", e);
         return;
     }
 
     let mut len_buf = [0u8; 2];
-    if stream.read_exact(&mut len_buf).await.is_err() {
-        stream = None;
-        continue;
-    }
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    let mut resp_buf = vec![0u8; resp_len];
-    if stream.read_exact(&mut resp_buf).await.is_err() {
-        stream = None;
-        continue;
+    if let Err(e) = stream.read_exact(&mut len_buf).await {
+        warn!("Failed to read DNS response length: {}", e);
+        return;
     }
 
-    if let Err(e) = dns_listener_tx.send_to(&resp_buf, addr).await {
-        warn!("Failed to send UDP response back to client: {}", e);
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+    let mut resp_buf = vec![0u8; resp_len];
+    if let Err(e) = stream.read_exact(&mut resp_buf).await {
+        warn!("Failed to read DNS response: {}", e);
+        return;
     }
+
+    match Message::from_octets(resp_buf) {
+        Ok(m) => record_table.insert(domain_name.to_string(), m),
+        Err(e) => {
+            warn!("Failed to parse DNS response: {}", e);
+            return;
+        }
+    };
 }
 
 async fn handle_dns_2(
@@ -358,51 +386,55 @@ async fn handle_dns_2(
     dns_listener_tx: Arc<UdpSocket>,
     remote_host: &str,
 ) {
-    // let mut record_table = HashMap::new();
-
+    let mut record_table = HashMap::new();
     let mut stream: Option<TcpStream> = None;
 
     loop {
         tokio::select! {
             Some(DnsCmd::Query { data, addr }) = rx.recv() => {
-                if stream.is_none() {
-                    // Internal: Connect implies sending SSH_MSG_CHANNEL_OPEN (The 230ms hit)
-                    // We only want to do this ONCE.
-                    stream = match TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await {
-                        Ok(s) => {Some(s)}
-                        Err(_) => {
-                            warn!("Failed to connect to DNS server");
-                            let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
-                            continue;
+                let dns_request = match Message::from_octets(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("Failed to parse DNS request: {}", e);
+                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                        continue;
+                    }
+                };
+
+                let qname = match dns_request
+                    .question()
+                    .filter(|x| x.is_ok())
+                    .map(|x| x.unwrap().qname().to_string())
+                    .next()
+                {
+                    Some(n) => n,
+                    None => {
+                        warn!("Failed to extract qname from DNS request");
+                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                        continue;
+                    }
+                };
+
+                let answer = match record_table.get(&qname) {
+                    Some(v) => v,
+                    None => {
+                        let start = std::time::Instant::now();
+                        update_record_table_2(&mut record_table, &qname, &data).await;
+                        info!("Update record table took: {}", start.elapsed().as_millis());
+
+                        match record_table.get(&qname) {
+                            Some(v) => v,
+                            None => {
+                                warn!("Failed to resolve DNS qname: {}", &qname);
+                                let _ = dns_listener_tx
+                                    .send_to(&create_servfail(&data, data.len()), addr);
+                                continue;
+                            }
                         }
                     }
-                }
+                };
 
-                let mut tcp_payload = Vec::with_capacity(data.len() + 2);
-                tcp_payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
-                tcp_payload.extend_from_slice(&data);
-                if let Some(ref mut s) = stream {
-                    if s.write_all(&tcp_payload).await.is_err() {
-                        stream = None;
-                        continue;
-                    }
 
-                    let mut len_buf = [0u8; 2];
-                    if s.read_exact(&mut len_buf).await.is_err() {
-                        stream = None;
-                        continue;
-                    }
-                    let resp_len = u16::from_be_bytes(len_buf) as usize;
-                    let mut resp_buf = vec![0u8; resp_len];
-                    if s.read_exact(&mut resp_buf).await.is_err() {
-                        stream = None;
-                        continue;
-                    }
-
-                    if let Err(e) = dns_listener_tx.send_to(&resp_buf, addr).await {
-                        warn!("Failed to send UDP response back to client: {}", e);
-                    }
-                }
             }
             _ = token.cancelled() => {
                 return;
