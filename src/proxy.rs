@@ -321,19 +321,13 @@ async fn handle_dns(
 }
 
 fn build_response_from_request(
-    dns_request: &Message<Vec<u8>>, // The new incoming query
-    cached_msg: &Message<Vec<u8>>,  // Your stored response
+    dns_request: &Message<Vec<u8>>,
+    cached_msg: &Message<Vec<u8>>,
 ) -> Result<Vec<u8>, ()> {
-    let mut response = match MessageBuilder::new_vec().start_answer(dns_request, Rcode::NOERROR) {
-        Ok(r) => r,
-        Err(_) => return Err(()),
-    };
-
-    response
-    // for record in cached_msg.answer() {
-    //     response.push(record.into());
-    // }
-
+    let mut response = MessageBuilder::new_vec()
+        .start_answer(dns_request, Rcode::NOERROR)
+        .map_err(|_| ())?;
+    todo!();
     Ok(response.finish().into())
 }
 
