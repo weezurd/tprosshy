@@ -1,5 +1,6 @@
-use domain::base::{Message, MessageBuilder, Name, iana::Rcode, record::ComposeRecord};
-use log::{error, info, warn};
+use domain::base::{Message, MessageBuilder, Name, iana::Rcode};
+use domain::rdata::AllRecordData;
+use log::{debug, error, info, warn};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -320,15 +321,39 @@ async fn handle_dns(
     }
 }
 
-fn build_response_from_request(
-    dns_request: &Message<Vec<u8>>,
-    cached_msg: &Message<Vec<u8>>,
+fn create_dns_response_2(
+    dns_request: &Message<&Vec<u8>>,
+    cached_dns_response: &Message<Vec<u8>>,
 ) -> Result<Vec<u8>, ()> {
-    let mut response = MessageBuilder::new_vec()
-        .start_answer(dns_request, Rcode::NOERROR)
-        .map_err(|_| ())?;
-    todo!();
-    Ok(response.finish().into())
+    let mut response = match MessageBuilder::new_vec().start_answer(dns_request, Rcode::NOERROR) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to create DNS response: {}", e);
+            return Err(());
+        }
+    };
+
+    // INTERNAL MECHANIC: The iterator yields a "Parser" view.
+    // We must explicitly parse the RData into a concrete type (AllRecordData)
+    // so the builder knows how to re-serialize it.
+    // `AllRecordData` is an enum covering all standard types (A, AAAA, MX, etc.).
+    let records = cached_dns_response
+        .answer()
+        .into_iter()
+        .flat_map(|it| it)
+        .filter(|x| x.is_ok())
+        .map(|x| x.unwrap().into_record::<AllRecordData<_, _>>())
+        .filter(|x| x.is_ok())
+        .map(|x| x.unwrap())
+        .filter(|x| x.is_some())
+        .map(|x| x.unwrap());
+
+    for r in records {
+        debug!("Received record: {}", r);
+        let _ = response.push(r);
+    }
+
+    Ok(response.answer().finish().into())
 }
 
 async fn update_record_table_2(
@@ -381,8 +406,6 @@ async fn handle_dns_2(
     remote_host: &str,
 ) {
     let mut record_table = HashMap::new();
-    let mut stream: Option<TcpStream> = None;
-
     loop {
         tokio::select! {
             Some(DnsCmd::Query { data, addr }) = rx.recv() => {
@@ -390,7 +413,9 @@ async fn handle_dns_2(
                     Ok(m) => m,
                     Err(e) => {
                         warn!("Failed to parse DNS request: {}", e);
-                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                        if let Err(e) = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr).await {
+                            warn!("Failed to send DNS response: {e}")
+                        };
                         continue;
                     }
                 };
@@ -404,7 +429,9 @@ async fn handle_dns_2(
                     Some(n) => n,
                     None => {
                         warn!("Failed to extract qname from DNS request");
-                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
+                        if let Err(e) = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr).await {
+                            warn!("Failed to send DNS response: {e}")
+                        };
                         continue;
                     }
                 };
@@ -420,14 +447,25 @@ async fn handle_dns_2(
                             Some(v) => v,
                             None => {
                                 warn!("Failed to resolve DNS qname: {}", &qname);
-                                let _ = dns_listener_tx
-                                    .send_to(&create_servfail(&data, data.len()), addr);
+                                if let Err(e) = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr).await {
+                                    warn!("Failed to send DNS response: {e}")
+                                };
                                 continue;
                             }
                         }
                     }
                 };
 
+                match create_dns_response_2(&dns_request, answer) {
+                    Ok(v) => {
+                        if let Err(e) = dns_listener_tx.send_to(&v, addr).await {
+                            warn!("Failed to send DNS response: {e}")
+                        };
+                    }
+                    Err(()) => {
+                        warn!("Failed to create DNS response")
+                    }
+                }
 
             }
             _ = token.cancelled() => {
