@@ -1,15 +1,14 @@
-use domain::base::{Message, MessageBuilder, Name, iana::Rcode};
+use domain::base::{Message, MessageBuilder, iana::Rcode};
 use domain::rdata::AllRecordData;
 use log::{debug, error, info, warn};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    str::FromStr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     vec,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
+    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
@@ -65,13 +64,7 @@ pub async fn init_proxy(
     let dns_listener_tx = dns_listener_rx.clone();
 
     let (tx, rx) = mpsc::channel(1);
-    // task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx, &remote_host));
-    task_tracker.spawn(handle_dns_2(
-        token.clone(),
-        rx,
-        dns_listener_tx,
-        &remote_host,
-    ));
+    task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx));
 
     info!(
         "Proxy server started. TCP listener address: {}. DNS listener address: {}. SOCKS5 port: {}",
@@ -87,7 +80,6 @@ pub async fn init_proxy(
             }
             Ok((buflen, addr)) = dns_listener_rx.recv_from(&mut buf) => {
                 if buflen < DNS_BUFSIZE {
-                    // task_tracker.spawn(handle_dns(buf, buflen, addr, leaked_dns_listener));
                     if let Err(e) = tx.send(DnsCmd::Query { data: buf[..buflen].to_vec(), addr }).await {
                         warn!("Failed to send DNS command to connection manager: {}", e);
                         continue
@@ -164,164 +156,6 @@ fn create_servfail(buf: &[u8], buflen: usize) -> Vec<u8> {
 }
 
 fn create_dns_response(
-    request: &Message<&Vec<u8>>,
-    qname_str: &str,
-    ips: &[IpAddr],
-) -> Result<Vec<u8>, ()> {
-    let rcode = match ips.len() {
-        0 => Rcode::SERVFAIL,
-        _ => Rcode::NOERROR,
-    };
-
-    let mut response = match MessageBuilder::new_vec().start_answer(request, rcode) {
-        Ok(r) => r,
-        Err(_) => return Err(()),
-    };
-
-    let domain_name = match Name::<Vec<u8>>::from_str(qname_str) {
-        Ok(n) => n,
-        Err(e) => {
-            warn!("Failed to convert qname to domain name: {}", e);
-            return Err(());
-        }
-    };
-
-    for ip in ips {
-        match ip {
-            IpAddr::V4(v4) => {
-                let _ = response.push((&domain_name, 300, domain::rdata::A::new(*v4)));
-            }
-            IpAddr::V6(v6) => {
-                let _ = response.push((&domain_name, 300, domain::rdata::Aaaa::new(*v6)));
-            }
-        }
-    }
-
-    Ok(response.answer().finish().into())
-}
-
-async fn update_record_table(
-    remote_host: &str,
-    record_table: &mut HashMap<String, Vec<IpAddr>>,
-    domain_name: &str,
-) {
-    let start = std::time::Instant::now();
-    let mut ssh_proc = match ssh(
-        remote_host,
-        None,
-        Some(format!("getent ahosts {} | grep DGRAM", domain_name)),
-        None,
-        false,
-    )
-    .await
-    {
-        Ok(x) => x,
-        Err(e) => {
-            warn!(
-                "Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
-                e, remote_host
-            );
-            return;
-        }
-    };
-    info!("Actual DNS request took: {}", start.elapsed().as_millis());
-
-    let stdout = match ssh_proc.stdout.take() {
-        Some(x) => x,
-        None => {
-            warn!("Failed to take stdout from ssh process");
-            return;
-        }
-    };
-
-    let mut reader = BufReader::new(stdout).lines();
-    let mut ips = vec![];
-
-    let start = std::time::Instant::now();
-    while let Ok(Some(line)) = reader.next_line().await {
-        // getent ahosts format: <IP> <SOCK_TYPE> <CANONICAL_NAME>
-        if let Some(ip_str) = line.split_whitespace().next()
-            && let Ok(ip) = ip_str.parse::<IpAddr>()
-        {
-            ips.push(ip);
-        }
-    }
-    info!("Reading DNS response took: {}", start.elapsed().as_millis());
-    record_table.insert(domain_name.to_string(), ips);
-}
-
-async fn handle_dns(
-    token: CancellationToken,
-    mut rx: mpsc::Receiver<DnsCmd>,
-    dns_listener_tx: Arc<UdpSocket>,
-    remote_host: &str,
-) {
-    let mut record_table = HashMap::new();
-
-    loop {
-        tokio::select! {
-            Some(DnsCmd::Query { data, addr }) = rx.recv() => {
-                let dns_request = match Message::from_octets(&data) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("Failed to parse DNS request: {}", e);
-                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
-                        continue;
-                    }
-                };
-
-                let qname = match dns_request
-                    .question()
-                    .filter(|x| x.is_ok())
-                    .map(|x| x.unwrap().qname().to_string())
-                    .next()
-                {
-                    Some(n) => n,
-                    None => {
-                        warn!("Failed to extract qname from DNS request");
-                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
-                        continue;
-                    }
-                };
-
-                let ips = match record_table.get(&qname) {
-                    Some(v) => v,
-                    None => {
-                        let start = std::time::Instant::now();
-                        update_record_table(remote_host, &mut record_table, &qname).await;
-                        info!("Update record table took: {}", start.elapsed().as_millis());
-
-                        match record_table.get(&qname) {
-                            Some(v) => v,
-                            None => {
-                                warn!("Failed to resolve DNS qname: {}", &qname);
-                                let _ = dns_listener_tx
-                                    .send_to(&create_servfail(&data, data.len()), addr);
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-                match create_dns_response(&dns_request, &qname, ips) {
-                    Ok(v) => {
-                        let _ = dns_listener_tx.send_to(&v, addr).await;
-                    }
-                    Err(()) => {
-                        warn!("Failed to create dns response");
-                        let _ = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr);
-                        continue;
-                    }
-                }
-            }
-            _ = token.cancelled() => {
-                return;
-            }
-        }
-    }
-}
-
-fn create_dns_response_2(
     dns_request: &Message<&Vec<u8>>,
     cached_dns_response: &Message<Vec<u8>>,
 ) -> Result<Vec<u8>, ()> {
@@ -356,7 +190,7 @@ fn create_dns_response_2(
     Ok(response.answer().finish().into())
 }
 
-async fn update_record_table_2(
+async fn update_record_table(
     record_table: &mut HashMap<String, Message<Vec<u8>>>,
     domain_name: &str,
     data: &[u8],
@@ -399,11 +233,11 @@ async fn update_record_table_2(
     };
 }
 
-async fn handle_dns_2(
+///
+async fn handle_dns(
     token: CancellationToken,
     mut rx: mpsc::Receiver<DnsCmd>,
     dns_listener_tx: Arc<UdpSocket>,
-    remote_host: &str,
 ) {
     let mut record_table = HashMap::new();
     loop {
@@ -440,7 +274,7 @@ async fn handle_dns_2(
                     Some(v) => v,
                     None => {
                         let start = std::time::Instant::now();
-                        update_record_table_2(&mut record_table, &qname, &data).await;
+                        update_record_table(&mut record_table, &qname, &data).await;
                         info!("Update record table took: {}", start.elapsed().as_millis());
 
                         match record_table.get(&qname) {
@@ -456,7 +290,7 @@ async fn handle_dns_2(
                     }
                 };
 
-                match create_dns_response_2(&dns_request, answer) {
+                match create_dns_response(&dns_request, answer) {
                     Ok(v) => {
                         if let Err(e) = dns_listener_tx.send_to(&v, addr).await {
                             warn!("Failed to send DNS response: {e}")
