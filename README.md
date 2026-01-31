@@ -15,7 +15,7 @@ cargo run -- --host [SSH CONFIG HOST] --ip [CIDR]
     ```
     RUSTFLAGS="--cfg tokio_unstable" cargo run -- --host [SSH CONFIG HOST] --ip [CIDR] --tracing
     ```
-    - In another terminal, run `tokio-console`:
+    - In another terminal, run `tokio-console`.
 
 ## Dev note
 - Always flush if underlying IO is buffered
