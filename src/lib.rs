@@ -26,10 +26,6 @@ pub struct Args {
     #[arg(long = "ip", default_value_t = String::from("0.0.0.0/0"))]
     pub ip_range: String,
 
-    // Enable dns proxy
-    #[arg(short, long, default_value_t = false)]
-    pub dns: bool,
-
     // Socks port
     #[arg(long, default_value_t = 1080)]
     pub socks_port: u16,
