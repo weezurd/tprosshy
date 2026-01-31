@@ -20,6 +20,7 @@
     - Daemon support
 
 ## Usage
+**NOTE:** Replace `cargo run --` with `tprosshy` binary when release build is used:
 ```
 [RUSTFLAGS="--cfg tokio_unstable" RUST_LOG=debug] cargo run -- --host ssh_config_host --ip ip_range [--socks-port socks_port] [--tracing]
 ```
