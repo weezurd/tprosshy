@@ -6,6 +6,7 @@ use tempfile::NamedTempFile;
 pub struct Method {
     path: String,
 }
+use crate::get_local_nameserver;
 
 static RULESET_TEMPLATE: Lazy<String> = Lazy::new(|| {
     r#"table ip tprosshy
@@ -19,7 +20,7 @@ add rule ip tprosshy PREROUTING counter jump PORTAL
 add rule ip tprosshy OUTPUT counter jump PORTAL
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr 127.0.0.1 return
 add rule ip tprosshy PORTAL meta l4proto tcp ip daddr {{allow_ips}} redirect to {{tcp_port}}
-add rule ip tprosshy PORTAL meta l4proto udp ip daddr 127.0.0.53 udp dport 53 redirect to {{udp_port}}
+add rule ip tprosshy PORTAL meta l4proto udp ip daddr {{local_nameserver}} udp dport 53 redirect to {{udp_port}}
 add rule ip tprosshy PORTAL fib daddr type local counter return
 "#
     .to_string()
@@ -37,10 +38,19 @@ impl Method {
 
 impl BaseMethod for Method {
     fn setup_fw(&self, allow_ips: &str, tcp_port: u16, udp_port: u16) -> Result<(), MethodError> {
+        let local_nameserver = match get_local_nameserver() {
+            Some(ns) => ns,
+            None => {
+                return Err(MethodError::SetupError(String::from(
+                    "Failed to get local nameserver",
+                )));
+            }
+        };
         let ruleset = RULESET_TEMPLATE
             .replace("{{allow_ips}}", allow_ips)
             .replace("{{tcp_port}}", &tcp_port.to_string())
-            .replace("{{udp_port}}", &udp_port.to_string());
+            .replace("{{udp_port}}", &udp_port.to_string())
+            .replace("{{local_nameserver}}", &local_nameserver);
 
         if let Ok(mut tmp_file) = NamedTempFile::new_in("/tmp")
             && let Ok(_) = write!(tmp_file, "{}", ruleset)
