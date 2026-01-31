@@ -231,7 +231,7 @@ fn create_dns_response(
         .map(|x| x.unwrap());
 
     for r in records {
-        debug!("Received record: {}", r);
+        debug!("Cached record: {}", r);
         let _ = response.push(r);
     }
 
@@ -239,8 +239,8 @@ fn create_dns_response(
 }
 
 async fn update_record_table(
-    record_table: &mut HashMap<String, Message<Vec<u8>>>,
-    domain_name: &str,
+    record_table: &mut HashMap<(String, String), Message<Vec<u8>>>,
+    qid: (String, String),
     data: &[u8],
 ) {
     let mut stream = match TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await {
@@ -273,7 +273,7 @@ async fn update_record_table(
     }
 
     match Message::from_octets(resp_buf) {
-        Ok(m) => record_table.insert(domain_name.to_string(), m),
+        Ok(m) => record_table.insert(qid.clone(), m),
         Err(e) => {
             warn!("Failed to parse DNS response: {e}");
             return;
@@ -301,15 +301,15 @@ async fn handle_dns(
                     }
                 };
 
-                let qname = match dns_request
+                let qid = match dns_request
                     .question()
                     .filter(|x| x.is_ok())
-                    .map(|x| x.unwrap().qname().to_string())
+                    .map(|x| x.unwrap())
                     .next()
                 {
-                    Some(n) => n,
+                    Some(x) => (x.qname().to_string(), x.qtype().to_string()),
                     None => {
-                        warn!("Failed to extract qname from DNS request");
+                        warn!("Failed to extract qtype from DNS request");
                         if let Err(e) = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr).await {
                             warn!("Failed to send DNS response: {e}")
                         };
@@ -317,14 +317,15 @@ async fn handle_dns(
                     }
                 };
 
-                let answer = match record_table.get(&qname) {
+
+                let answer = match record_table.get(&qid) {
                     Some(v) => v,
                     None => {
-                        update_record_table(&mut record_table, &qname, &data).await;
-                        match record_table.get(&qname) {
+                        update_record_table(&mut record_table, qid.clone(), &data).await;
+                        match record_table.get(&qid) {
                             Some(v) => v,
                             None => {
-                                warn!("Failed to resolve DNS qname: {}", &qname);
+                                warn!("Failed to resolve DNS qname: {}", &qid.0);
                                 if let Err(e) = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr).await {
                                     warn!("Failed to send DNS response: {e}")
                                 };
