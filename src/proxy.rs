@@ -1,18 +1,20 @@
 use domain::base::{Message, MessageBuilder, iana::Rcode};
 use domain::rdata::AllRecordData;
 use log::{debug, error, info, warn};
+use std::error::Error;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     vec,
 };
+use tokio::process::Child;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
-use crate::{get_original_dst, get_remote_nameserver, ssh};
+use crate::{get_available_net_tool, get_original_dst, get_remote_nameserver, ssh};
 use fast_socks5::client::Socks5Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -20,28 +22,24 @@ use tokio_util::sync::CancellationToken;
 const LOCAL_DNS_PORT: u16 = 5353;
 const DNS_BUFSIZE: usize = 1024;
 
-pub async fn init_proxy(
-    token: CancellationToken,
-    tcp_listener: TcpListener,
-    dns_listener: UdpSocket,
-    socks_port: u16,
-    remote_host: String,
-) {
-    let remote_host: &'static str = remote_host.leak();
-    let task_tracker = tokio_util::task::TaskTracker::new();
-    let mut buf = [0u8; DNS_BUFSIZE];
+enum DnsCmd {
+    Query { data: Vec<u8>, addr: SocketAddr },
+}
 
+async fn init_ssh_tunnel(
+    remote_host: &'static str,
+    socks_port: u16,
+) -> Result<Child, Box<dyn Error>> {
     let remote_nameserver = match get_remote_nameserver(&remote_host).await {
         Some(x) => x,
         None => {
-            warn!(
-                "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf"
+            return Err(
+                "Failed to get remote nameserver. Please check remote nameserver at /etc/resolv.conf".to_string().into(),
             );
-            return;
         }
     };
 
-    let mut ssh_proc = match ssh(
+    match ssh(
         &remote_host,
         Some(socks_port),
         None,
@@ -50,21 +48,73 @@ pub async fn init_proxy(
     )
     .await
     {
-        Ok(x) => x,
+        Ok(x) => Ok(x),
         Err(e) => {
-            warn!(
-                "Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
-                e, &remote_host
+            return Err(
+                format!("Failed to init ssh process: {}. Please check if remote server \"{}\" is accessible",
+                e, &remote_host).into()
             );
+        }
+    }
+}
+
+pub async fn init_proxy(
+    token: CancellationToken,
+    socks_port: u16,
+    remote_host: &'static str,
+    ip_range: String,
+) {
+    let tcp_listener = match TcpListener::bind("0.0.0.0:0").await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Failed to bind address: {e}");
             return;
         }
     };
 
+    let tcp_binding_addr = match tcp_listener.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!("Failed to bind address for tcp listener: {e}");
+            return;
+        }
+    };
+
+    let dns_listener = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(socket) => socket,
+        Err(e) => {
+            error!("Failed to bind address: {e}");
+            return;
+        }
+    };
+
+    let udp_binding_addr = match dns_listener.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!("Failed to bind address for udp listener: {e}");
+            return;
+        }
+    };
+
+    let task_tracker = tokio_util::task::TaskTracker::new();
     let dns_listener_rx = Arc::new(dns_listener);
     let dns_listener_tx = dns_listener_rx.clone();
-
     let (tx, rx) = mpsc::channel(1);
     task_tracker.spawn(handle_dns(token.clone(), rx, dns_listener_tx));
+
+    let mut ssh_tunnel = match init_ssh_tunnel(&remote_host, socks_port).await {
+        Ok(x) => x,
+        Err(e) => {
+            error!("Failed to init ssh tunnel: {e}");
+            return;
+        }
+    };
+
+    let net_tool = get_available_net_tool();
+    if let Err(e) = net_tool.setup_fw(&ip_range, tcp_binding_addr.port(), udp_binding_addr.port()) {
+        error!("Failed to setup firewall: {e}");
+        return;
+    }
 
     info!(
         "Proxy server started. TCP listener address: {}. DNS listener address: {}. SOCKS5 port: {}",
@@ -73,6 +123,7 @@ pub async fn init_proxy(
         socks_port
     );
 
+    let mut buf = [0u8; DNS_BUFSIZE];
     loop {
         tokio::select! {
             Ok((ingress, _)) = tcp_listener.accept() => {
@@ -81,7 +132,7 @@ pub async fn init_proxy(
             Ok((buflen, addr)) = dns_listener_rx.recv_from(&mut buf) => {
                 if buflen < DNS_BUFSIZE {
                     if let Err(e) = tx.send(DnsCmd::Query { data: buf[..buflen].to_vec(), addr }).await {
-                        warn!("Failed to send DNS command to connection manager: {}", e);
+                        warn!("Failed to send DNS request: {e}");
                         continue
                     }
                 } else {
@@ -91,9 +142,10 @@ pub async fn init_proxy(
             _ = token.cancelled() => {
                 task_tracker.close();
                 task_tracker.wait().await;
-                if let Err(e) = ssh_proc.kill().await {
-                    warn!("Failed to kill ssh process: {}", e)
+                if let Err(e) = ssh_tunnel.kill().await {
+                    warn!("Failed to kill ssh process: {e}")
                 }
+                net_tool.restore_fw().expect("Failed to restore firewall");
                 break
             }
         }
@@ -126,14 +178,10 @@ async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port:
             }
         }
         Err(e) => {
-            warn!("Failed to init connection to socks5 server: {}", e);
+            warn!("Failed to init connection to socks5 server: {e}");
         }
     }
     info!("Connection closed.");
-}
-
-enum DnsCmd {
-    Query { data: Vec<u8>, addr: SocketAddr },
 }
 
 fn create_servfail(buf: &[u8], buflen: usize) -> Vec<u8> {
@@ -162,7 +210,7 @@ fn create_dns_response(
     let mut response = match MessageBuilder::new_vec().start_answer(dns_request, Rcode::NOERROR) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Failed to create DNS response: {}", e);
+            warn!("Failed to create DNS response: {e}");
             return Err(());
         }
     };
@@ -198,7 +246,7 @@ async fn update_record_table(
     let mut stream = match TcpStream::connect(format!("localhost:{}", LOCAL_DNS_PORT)).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("Failed to connect to DNS server: {}", e);
+            warn!("Failed to connect to DNS server: {e}");
             return;
         }
     };
@@ -207,33 +255,32 @@ async fn update_record_table(
     tcp_payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
     tcp_payload.extend_from_slice(&data);
     if let Err(e) = stream.write_all(&tcp_payload).await {
-        warn!("Failed to make DNS request: {}", e);
+        warn!("Failed to make DNS request: {e}");
         return;
     }
 
     let mut len_buf = [0u8; 2];
     if let Err(e) = stream.read_exact(&mut len_buf).await {
-        warn!("Failed to read DNS response length: {}", e);
+        warn!("Failed to read DNS response length: {e}");
         return;
     }
 
     let resp_len = u16::from_be_bytes(len_buf) as usize;
     let mut resp_buf = vec![0u8; resp_len];
     if let Err(e) = stream.read_exact(&mut resp_buf).await {
-        warn!("Failed to read DNS response: {}", e);
+        warn!("Failed to read DNS response: {e}");
         return;
     }
 
     match Message::from_octets(resp_buf) {
         Ok(m) => record_table.insert(domain_name.to_string(), m),
         Err(e) => {
-            warn!("Failed to parse DNS response: {}", e);
+            warn!("Failed to parse DNS response: {e}");
             return;
         }
     };
 }
 
-///
 async fn handle_dns(
     token: CancellationToken,
     mut rx: mpsc::Receiver<DnsCmd>,
@@ -246,7 +293,7 @@ async fn handle_dns(
                 let dns_request = match Message::from_octets(&data) {
                     Ok(m) => m,
                     Err(e) => {
-                        warn!("Failed to parse DNS request: {}", e);
+                        warn!("Failed to parse DNS request: {e}");
                         if let Err(e) = dns_listener_tx.send_to(&create_servfail(&data, data.len()), addr).await {
                             warn!("Failed to send DNS response: {e}")
                         };
@@ -273,10 +320,7 @@ async fn handle_dns(
                 let answer = match record_table.get(&qname) {
                     Some(v) => v,
                     None => {
-                        let start = std::time::Instant::now();
                         update_record_table(&mut record_table, &qname, &data).await;
-                        info!("Update record table took: {}", start.elapsed().as_millis());
-
                         match record_table.get(&qname) {
                             Some(v) => v,
                             None => {
