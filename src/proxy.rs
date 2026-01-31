@@ -26,6 +26,18 @@ enum DnsCmd {
     Query { data: Vec<u8>, addr: SocketAddr },
 }
 
+/// Initializes an SSH tunnel with SOCKS and DNS port forwarding.
+/// 
+/// # Parameters
+/// - `remote_host`: SSH host to connect to (must be reachable and properly
+///   configured in SSH config or via `user@host` syntax).
+/// - `socks_port`: Local port to expose the SOCKS5 proxy.
+///
+/// # Returns
+/// - `Ok(Child)` if the SSH tunnel is successfully established and verified.
+/// - `Err(Box<dyn Error>)` if:
+///   - The remote nameserver cannot be determined
+///   - The SSH process fails to start
 async fn init_ssh_tunnel(
     remote_host: &'static str,
     socks_port: u16,
@@ -58,6 +70,41 @@ async fn init_ssh_tunnel(
     }
 }
 
+/// Initializes and runs the transparent proxy.
+///
+/// This function sets up:
+/// - A TCP listener for transparently proxied TCP traffic
+/// - A UDP listener for DNS requests
+/// - An SSH tunnel providing a SOCKS5 proxy and DNS port forwarding
+/// - Firewall rules to redirect traffic into the proxy
+///
+/// It then enters the main event loop, handling TCP connections and DNS
+/// packets until the provided cancellation token is triggered.
+///
+/// # Parameters
+/// - `token`: Cancellation token used for graceful shutdown.
+/// - `socks_port`: Local SOCKS5 port exposed by the SSH tunnel.
+/// - `remote_host`: SSH host used to establish the tunnel.
+/// - `ip_range`: IP range to be redirected by firewall rules.
+///
+/// # Behavior
+/// - Dynamically binds TCP and UDP listeners to ephemeral ports.
+/// - Spawns background tasks for DNS handling and TCP connection handling.
+/// - Configures firewall rules to redirect traffic to the listeners.
+/// - Cleans up firewall state and terminates the SSH tunnel on shutdown.
+///
+/// # Failure Modes
+/// - Returns early if socket binding, SSH tunnel setup, or firewall
+///   configuration fails.
+/// - Errors during request handling are logged and ignored to keep
+///   the proxy running.
+///
+/// # Side Effects
+/// - Modifies system firewall rules.
+///
+/// # Limitations
+/// - IPv4 only.
+/// - No UDP forwarding beyond DNS.
 pub async fn init_proxy(
     token: CancellationToken,
     socks_port: u16,
@@ -152,6 +199,30 @@ pub async fn init_proxy(
     }
 }
 
+/// Handles a single transparently redirected TCP connection.
+///
+/// This function determines the original destination of a NAT-ed TCP
+/// connection, establishes a SOCKS5 connection to that destination via
+/// the local SSH tunnel, and then relays traffic bidirectionally.
+///
+/// The connection remains active until either side closes or the
+/// cancellation token is triggered.
+///
+/// # Parameters
+/// - `stream`: Incoming TCP stream redirected by firewall rules.
+/// - `token`: Cancellation token used to interrupt the connection.
+/// - `socks_port`: Local SOCKS5 port exposed by the SSH tunnel.
+///
+/// # Behavior
+/// - Connects to the destination via a local SOCKS5 proxy.
+/// - Relays data using bidirectional copy.
+///
+/// # Failure Modes
+/// - Logs and returns if the original destination cannot be determined.
+/// - Logs and returns if the SOCKS5 connection fails.
+///
+/// # Limitations
+/// - IPv4 only.
 async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port: u16) {
     let dst = match get_original_dst(socket2::SockRef::from(&stream)) {
         Ok(addr) => addr,
@@ -184,6 +255,29 @@ async fn handle_tcp(mut stream: TcpStream, token: CancellationToken, socks_port:
     info!("Connection closed.");
 }
 
+/// Constructs a minimal DNS `SERVFAIL` response for a given request.
+///
+/// This function builds a raw DNS response buffer that:
+/// - Preserves the original transaction ID
+/// - Marks the message as a response
+/// - Sets the response code to `SERVFAIL`
+/// - Echoes the original question section verbatim
+///
+/// It does not attempt to fully parse or validate the incoming DNS packet.
+/// This is intentionally a best-effort fallback used when request parsing
+/// or resolution fails.
+///
+/// # Parameters
+/// - `buf`: Raw DNS request bytes.
+/// - `buflen`: Length of the valid data in `buf`.
+///
+/// # Returns
+/// A byte vector containing a DNS `SERVFAIL` response suitable for sending
+/// directly over UDP.
+///
+/// # Limitations
+/// - Assumes a standard 12-byte DNS header.
+/// - Does not support EDNS or additional sections.
 fn create_servfail(buf: &[u8], buflen: usize) -> Vec<u8> {
     let mut response = Vec::with_capacity(buflen);
 
@@ -203,6 +297,28 @@ fn create_servfail(buf: &[u8], buflen: usize) -> Vec<u8> {
     return response;
 }
 
+/// Builds a DNS response using cached answer records.
+///
+/// This function takes a parsed DNS request and a cached DNS response,
+/// then constructs a new DNS answer message that:
+/// - Mirrors the original request header and question
+/// - Re-serializes cached answer records into the response
+///
+/// Internally, record data is fully parsed into `AllRecordData` so the
+/// `MessageBuilder` can correctly re-encode it.
+///
+/// # Parameters
+/// - `dns_request`: Parsed DNS request message.
+/// - `cached_dns_response`: Cached DNS response containing answer records.
+///
+/// # Returns
+/// - `Ok(Vec<u8>)` containing a serialized DNS response.
+/// - `Err(())` if response construction fails.
+///
+/// # Notes
+/// - Only answer records are copied; authority and additional sections
+///   are ignored.
+/// - Record TTLs are preserved only insofar as they exist in the cached data.
 fn create_dns_response(
     dns_request: &Message<&Vec<u8>>,
     cached_dns_response: &Message<Vec<u8>>,
@@ -215,10 +331,6 @@ fn create_dns_response(
         }
     };
 
-    // INTERNAL MECHANIC: The iterator yields a "Parser" view.
-    // We must explicitly parse the RData into a concrete type (AllRecordData)
-    // so the builder knows how to re-serialize it.
-    // `AllRecordData` is an enum covering all standard types (A, AAAA, MX, etc.).
     let records = cached_dns_response
         .answer()
         .into_iter()
@@ -238,6 +350,29 @@ fn create_dns_response(
     Ok(response.answer().finish().into())
 }
 
+/// Queries an upstream DNS server and updates the local DNS cache.
+///
+/// This function forwards a raw DNS query over TCP to a local upstream
+/// DNS listener, reads the response, parses it, and stores the result
+/// in the provided record table.
+///
+/// TCP framing (two-byte length prefix) is handled explicitly, as required
+/// by DNS-over-TCP.
+///
+/// # Parameters
+/// - `record_table`: Mutable DNS cache mapping `(qname, qtype)` to responses.
+/// - `qid`: Query identifier `(qname, qtype)` used as the cache key.
+/// - `data`: Raw DNS request bytes.
+///
+/// # Behavior
+/// - On success, inserts the parsed DNS response into `record_table`.
+/// - On failure, logs a warning and leaves the cache unchanged.
+///
+/// # Notes
+/// - This function performs no TTL handling or eviction.
+/// - Errors are intentionally non-fatal to keep the DNS loop running.
+///
+/// # TODO: TTL handling
 async fn update_record_table(
     record_table: &mut HashMap<(String, String), Message<Vec<u8>>>,
     qid: (String, String),
@@ -281,6 +416,28 @@ async fn update_record_table(
     };
 }
 
+/// Main DNS request handling loop.
+///
+/// This async task receives DNS queries over a channel, attempts to answer
+/// them from a local cache, and falls back to querying an upstream DNS server
+/// when necessary.
+///
+/// Responses are sent back to clients over UDP. The loop runs until the
+/// provided cancellation token is triggered.
+///
+/// # Parameters
+/// - `token`: Cancellation token used for graceful shutdown.
+/// - `rx`: Channel receiver for incoming DNS commands.
+/// - `dns_listener_tx`: UDP socket used to send DNS responses.
+///
+/// # Behavior
+/// - Parses incoming DNS requests.
+/// - Caches responses keyed by `(qname, qtype)`.
+/// - Sends `SERVFAIL` responses on parsing or resolution errors.
+///
+/// # Limitations
+/// - Single-threaded cache access.
+/// - UDP-only client interface.
 async fn handle_dns(
     token: CancellationToken,
     mut rx: mpsc::Receiver<DnsCmd>,

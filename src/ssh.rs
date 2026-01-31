@@ -8,6 +8,33 @@ use tokio::time::sleep;
 
 const RETRY: usize = 10;
 
+/// Spawns an `ssh` process with optional SOCKS and port-forwarding configuration.
+///
+/// This function starts an SSH connection using OpenSSH’s built-in forwarding
+/// mechanisms (`-D` for dynamic/SOCKS forwarding and `-L` for local port forwarding).
+/// It relies on SSH ControlMaster to allow connection reuse and status checks.
+///
+/// If `check_connection` is enabled, the function will poll the control socket
+/// using `ssh -O check` until the connection is established or a retry limit
+/// is reached.
+///
+/// # Parameters
+/// - `host`: SSH host (as defined in SSH config or `user@host` format).
+/// - `socks_port`: Optional local port for SOCKS5 dynamic forwarding (`-D`).
+/// - `remote_command`: Optional command to execute on the remote host.
+/// - `local_portforwarding`: Optional local port forwarding specification (`-L`).
+/// - `check_connection`: Whether to actively wait for the SSH control connection
+///   to become ready.
+///
+/// # Returns
+/// - `Ok(Child)` if the SSH process is successfully started (and verified if
+///   `check_connection` is true).
+/// - `Err(String)` if spawning fails or the connection does not become ready
+///   within the retry limit.
+///
+/// # Notes
+/// - Host key checking is disabled.
+/// - The SSH process is killed if connection checks fail.
 pub(crate) async fn ssh(
     host: &str,
     socks_port: Option<u16>,
@@ -83,6 +110,27 @@ pub(crate) async fn ssh(
     }
 }
 
+/// Retrieves the first DNS nameserver configured on the remote host.
+///
+/// This function connects to the remote system via SSH and extracts the first
+/// `nameserver` entry from `/etc/resolv.conf`. It assumes a Linux-like environment
+/// and does not handle systemd-resolved or other resolver abstractions.
+///
+/// Internally, it spawns a short-lived SSH process, reads a single line from
+/// stdout, and then terminates the process.
+///
+/// # Parameters
+/// - `remote_host`: SSH host to query.
+///
+/// # Returns
+/// - `Some(IpAddr)` if a valid nameserver IP is found and parsed.
+/// - `None` if the SSH command fails, no nameserver is present, or the output
+///   cannot be parsed as an IP address.
+///
+/// # Caveats
+/// - Only the first `nameserver` entry is considered.
+/// - IPv4 and IPv6 are supported only if the returned value parses correctly
+///   as `IpAddr`.
 pub(crate) async fn get_remote_nameserver(remote_host: &str) -> Option<IpAddr> {
     match ssh(
         remote_host,
