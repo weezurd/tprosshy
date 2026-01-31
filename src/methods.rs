@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 #[derive(Debug)]
-pub enum MethodError {
+pub(crate) enum MethodError {
     SetupError(String),
     RestoreError(String),
 }
@@ -20,11 +20,11 @@ impl Display for MethodError {
 
 impl Error for MethodError {}
 
-pub trait BaseMethod {
+pub(crate) trait BaseMethod {
     fn setup_fw(&self, allow_ips: &str, tcp_port: u16, udp_port: u16) -> Result<(), MethodError>;
     fn restore_fw(&self) -> Result<(), MethodError>;
 }
 
-pub fn get_available_net_tool() -> Box<dyn BaseMethod + Send + Sync> {
+pub(crate) fn get_available_net_tool() -> Box<dyn BaseMethod + Send + Sync> {
     Box::new(nft::Method::new())
 }

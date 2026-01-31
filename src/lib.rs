@@ -1,14 +1,16 @@
 mod methods;
-pub use methods::get_available_net_tool;
+use methods::get_available_net_tool;
 
 mod proxy;
 pub use proxy::init_proxy;
 
 mod ssh;
-use ssh::{get_remote_nameserver, ssh};
+use ssh::get_remote_nameserver;
+use ssh::ssh;
 
-pub mod utils;
-pub use utils::{get_original_dst, init_logger};
+mod utils;
+pub use utils::init_logger;
+use utils::{get_local_nameserver, get_original_dst};
 
 use clap::Parser;
 
