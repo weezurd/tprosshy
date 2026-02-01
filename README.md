@@ -13,11 +13,25 @@
     - nftables firewall support
 - Missing features include, but not limited to:
     - IPv6
-    - Other firewalls, such as OSX support
-    - UDP support
+    - Other firewalls, such as OSX and Windows support
     - DNS record TTL handling. Current DNS cache is simply a hashmap
+    - UDP support
     - Other mechanisms to get nameserver from remote `/etc/resolv.conf` in case `awk` is unavailable
     - Daemon support
+
+## Installing
+[Cargo](https://github.com/rust-lang/cargo) is required to install `tprosshy`. 
+    
+```
+# crates.io
+cargo install tprosshy
+
+# From source
+git clone https://github.com/weezurd/tprosshy.git
+cd tprosshy
+cargo build --release
+export PATH=$PATH:$(pwd)/target/release/tprosshy
+```
 
 ## Usage
 **NOTE:** Replace `cargo run --` with `tprosshy` binary when release build is used:
