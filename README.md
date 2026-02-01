@@ -40,7 +40,7 @@ export PATH=$PATH:$(pwd)/target/release/tprosshy
 ```
 This creates two ssh tunnels: 
 - A "dynamic port forwarding" tunnel (aka SOCKS5 proxy) for tcp. 
-- A "local port forwarding" one for dns. 
+- A "local port forwarding" tunnel for dns. 
 
 All tcp and dns traffic are transparently proxied to remote server with the help of firewall. By default ssh is configured with -D 127.0.0.1:1080, the socks address can be changed with the `--socks-port` option.
 
