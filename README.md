@@ -47,6 +47,7 @@ All tcp and dns traffic are transparently proxied to remote server with the help
 `--tracing` option could be used with [tokio-console](https://github.com/tokio-rs/console) to collect diagnostic data. `RUSTFLAGS="--cfg tokio_unstable"` is required for this option.
 
 ## Miscellaneous
+- The name `tprosshy` is taken from "**T**ransparent **PR**oxy over **SSH**-**Y**"
 - Just like `sshuttle`, `tprosshy` is created as a workaround for crappy/unreliable VPN solution. Besides, network programming is both challenging and fun. 
 - TCP segment size is somewhat unpredictable due to several factors. Ref: https://datatracker.ietf.org/doc/html/rfc9293#name-segmentation. This behavior might need to be considered when implement tcp listener.
 - Always flush if underlying IO is buffered
